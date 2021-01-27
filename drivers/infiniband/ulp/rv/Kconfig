@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
+#
+config INFINIBAND_RV
+	tristate "InfiniBand Rendezvous Protocol"
+	depends on X86_64 && INFINIBAND
+	---help---
+	Experimental.

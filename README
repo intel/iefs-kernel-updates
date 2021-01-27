@@ -1,0 +1,11 @@
+
+Building the software
+
+./do-update-makerpm.sh -S ${PWD} -w ${PWD}/tmp
+
+Make sure you clear out the tmp directory before rebuilding
+
+Once the SRC RPM is created, build the binary RPM from ./tmp/rpmbuild directory execute the following command
+
+rpmbuild --rebuild --define "_topdir $(pwd)" --nodeps SRPMS/*.src.rpm
+
