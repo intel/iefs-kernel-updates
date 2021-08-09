@@ -1,0 +1,22 @@
+
+Building the software
+
+./do-update-makerpm.sh -S ${PWD} -w ${PWD}/tmp
+
+To build the CUDA version
+
+./do-update-makerpm.sh -G -S ${PWD} -w ${PWD}/tmp
+
+Before running the CUDA builds, make sure the CUDA packages are installed
+on your machine. Also export the appropriate UDA directories for a given distro:
+
+RHEL 8.1
+
+export NVIDIA_GPU_DIRECT=${NVIDIA_GPU_DIRECT:-/usr/src/nvidia-460.32.03}
+
+Make sure you clear out the tmp directory before rebuilding
+
+Once the SRC RPM is created, build the binary RPM from ./tmp/rpmbuild directory execute the following command
+
+rpmbuild --rebuild --define "_topdir $(pwd)" --nodeps SRPMS/*.src.rpm
+

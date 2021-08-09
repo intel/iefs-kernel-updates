@@ -1,0 +1,50 @@
+#
+# rdmavt module
+#
+#
+# Called from the kernel module build system.
+#
+ifneq ($(KERNELRELEASE),)
+#kbuild part of makefile
+
+NOSTDINC_FLAGS += -I${M}/include -I${M}/compat
+ifneq ($(NVIDIA_GPU_DIRECT),)
+NOSTDINC_FLAGS += -DNVIDIA_GPU_DIRECT
+endif
+
+obj-$(CONFIG_INFINIBAND_RV) += rv.o
+
+rv-y := rv_main.o rv_file.o rv_mr_cache.o gdr_ops.o trace.o \
+	compat_common.o compat.o rv_mr.o rv_rdma.o rv_conn.o
+
+CFLAGS_trace.o = -I$(src)
+
+ifneq ($(NVIDIA_GPU_DIRECT),)
+CFLAGS_rv_main.o = -DRV_IDSTR=\"gpu-direct\"
+CFLAGS_rv_main.o += -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_file.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_mr_cache.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_mr.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_rdma.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_conn.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_gdr_ops.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+endif
+
+ifdef MVERSION
+CFLAGS_rv_main.o += -DRV_DRIVER_VERSION_BASE=\"$(MVERSION)\"
+endif
+
+else
+#normal makefile
+KDIR ?= /lib/modules/`uname -r`/build
+
+default:
+	$(MAKE) -C $(KDIR) M=$$PWD CONFIG_INFINIBAND_RV=m NOSTDINC_FLAGS=-I$$PWD
+
+clean:
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+
+install:
+	$(MAKE) INSTALL_MOD_DIR=updates -C $(KDIR) M=$$PWD modules_install
+
+endif
