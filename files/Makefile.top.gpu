@@ -1,0 +1,33 @@
+#
+# Top level
+#
+#
+# Called from the kernel module build system.
+#
+ifneq ($(MOFED_PATH),)
+KBUILD_EXTRA_SYMBOLS += $(MOFED_PATH)/Module.symvers
+endif
+ifneq ($(NVIDIA_GPU_DIRECT),)
+KBUILD_EXTRA_SYMBOLS += $(NVIDIA_GPU_DIRECT)/Module.symvers
+endif
+
+ifneq ($(KERNELRELEASE),)
+#kbuild part of makefile
+
+CFLAGS_MODULE += -DUSE_PI_LED_ENABLE=1 -DIFS_DISTRO
+obj-y := rv/
+
+else
+#normal makefile
+KDIR ?= /lib/modules/`uname -r`/build
+
+default:
+	$(MAKE) -C $(KDIR) CONFIG_INFINIBAND_RV=m  M=$$PWD
+
+clean:
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+
+install:
+	$(MAKE) INSTALL_MOD_DIR=updates -C $(KDIR) M=$$PWD modules_install
+
+endif
