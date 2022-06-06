@@ -1,0 +1,10 @@
+#!/bin/sh
+# postinst script for @DEBNAME@
+#
+# see: dh_installdeb(1)
+
+set -e
+
+dkms add -m @DEBNAME@ -v @DEBRELEASE@ || :
+dkms build -m @DEBNAME@ -v @DEBRELEASE@ || :
+dkms install -m @DEBNAME@ -v @DEBRELEASE@ --force || :

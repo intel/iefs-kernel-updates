@@ -1,0 +1,25 @@
+Source: @DEBNAME@
+Section: unknown
+Priority: optional
+Maintainer: https://www.intel.com/content/www/us/en/support.html
+Build-Depends: linux-headers
+Standards-Version: 4.5.1
+Homepage: <insert the upstream URL, if relevant>
+#Vcs-Browser: https://salsa.debian.org/debian/hw
+#Vcs-Git: https://salsa.debian.org/debian/hw.git
+Rules-Requires-Root: no
+
+Package: kmod-@DEBNAME@
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}, linux-image
+Description: Updated kernel modules for Intel Ethernet Fabric Suite
+
+Package: @DEBNAME@-devel
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Development header files for Intel Ethernet Fabric Suite
+
+Package: @DEBNAME@-dkms
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}, dkms
+Description: Updated kernel modules for Intel Ethernet Fabric Suite
