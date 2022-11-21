@@ -1,0 +1,42 @@
+#
+# rdmavt module
+#
+#
+# Called from the kernel module build system.
+#
+ifneq ($(KERNELRELEASE),)
+#kbuild part of makefile
+
+ifneq ($(MOFED_PATH),)
+NOSTDINC_FLAGS += -I$(MOFED_PATH)/include -DHAVE_MOFED
+# For SLES 15.2, we need to have the following define to build.
+ifeq ("$(KERNELRELEASE)","5.3.18-22-default")
+NOSTDINC_FLAGS += -DHAVE_TC_SETUP_FLOW_ACTION
+endif
+endif
+NOSTDINC_FLAGS += -I${M}/include -I${M}/compat
+
+obj-$(CONFIG_INFINIBAND_RV) += rv.o
+
+rv-y := rv_main.o rv_file.o rv_mr_cache.o trace.o compat_common.o compat.o \
+	rv_mr.o rv_rdma.o rv_conn.o
+
+CFLAGS_trace.o = -I$(src)
+ifdef MVERSION
+CFLAGS_rv_main.o = -DRV_DRIVER_VERSION_BASE=\"$(MVERSION)\"
+endif
+
+else
+#normal makefile
+KDIR ?= /lib/modules/`uname -r`/build
+
+default:
+	$(MAKE) -C $(KDIR) M=$$PWD CONFIG_INFINIBAND_RV=m NOSTDINC_FLAGS=-I$$PWD
+
+clean:
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+
+install:
+	$(MAKE) INSTALL_MOD_DIR=updates -C $(KDIR) M=$$PWD modules_install
+
+endif

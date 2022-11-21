@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# doinstall: helper script to install the rv module
+# expected argument: stage directory
+# expected environment: 
+#    KERNEL_MOD_SIGNING_ENABLED=0/1
+#    KERNEL_MOD_SIGNING_TOOL=/full/path/to/signing/tool
+
+
+set -Eeuo pipefail
+
+function error_exit()
+{
+	echo "$(basename $0) FAILED"
+}
+trap 'error_exit' ERR
+
+CURDIR=$1
+
+if [ "${KERNEL_MOD_SIGNING_ENABLED}" == "1" ]; then
+	${KERNEL_MOD_SIGNING_TOOL} ${CURDIR}/rv/rv.ko
+fi
+
+mkdir -p ${CURDIR}/lib/modules/@DEBVERSION@/extra/iefs-kernel-updates
+cp ${CURDIR}/rv/rv.ko ${CURDIR}/lib/modules/@DEBVERSION@/extra/iefs-kernel-updates
+mkdir -p ${CURDIR}/etc/depmod.d
+cp ${CURDIR}/iefs-kernel-updates.conf ${CURDIR}/etc/depmod.d
+mkdir -p ${CURDIR}/etc/modules-load.d
+cp ${CURDIR}/modules-load.conf ${CURDIR}/etc/modules-load.d/iefs-kernel-updates.conf
+mkdir -p ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/rv_default
+cp ${CURDIR}/modules.order ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/rv_default
+cp ${CURDIR}/rv/*.* ${CURDIR}/rv/.*.cmd ${CURDIR}/rv/Makefile ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/rv_default
+mkdir -p ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/include/uapi/rdma
+cp ${CURDIR}/rv/rv_user_ioctls.h ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/include/uapi/rdma
+cp -r ${CURDIR}/{LICENSE,Makefile,Module.symvers,compat,dkms.conf,include,modules.order} ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@
+(
+	cd /usr/src/linux-headers-${DEFAULT_KERNEL_VERSION}/scripts
+	if [ ! -f unifdef ]; then
+		/usr/bin/gcc unifdef.c -o unifdef
+	fi
+)
+(cd /usr/src/linux-headers-${DEFAULT_KERNEL_VERSION};sh -x ./scripts/headers_install.sh ${CURDIR}/rv/rv_user_ioctls.h ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@/include/uapi/rdma/rv_user_ioctls.h)
+mkdir -p ${CURDIR}/usr/include/rdma
+cp ${CURDIR}/rv/rv_user_ioctls.h ${CURDIR}/usr/include/rdma
+(cd ${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@; ln -s rv_default rv)
+
+echo "doinstall finished"
+
+exit 0
+
+

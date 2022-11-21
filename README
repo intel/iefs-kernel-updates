@@ -1,0 +1,52 @@
+
+Building the software
+
+./do-update-makerpm.sh -S ${PWD} -w ${PWD}/tmp
+
+To build the GPU enabled version
+
+./do-update-makerpm.sh -G -S ${PWD} -w ${PWD}/tmp
+
+Before running the CUDA builds, make sure the CUDA packages are installed
+on your machine. Also export the following directories
+
+SLES 12.2
+
+export NVIDIA_GPU_DIRECT=${NVIDIA_GPU_DIRECT:-/usr/src/kernel-modules/nvidia-367.48-default}
+
+SLES 12.3
+
+export NVIDIA_GPU_DIRECT=${NVIDIA_GPU_DIRECT:-/opt/nvidia/NVIDIA-Linux-x86_64-384.66-diagnostic/kernel}
+
+RHEL 7.3 and 7.4 and 7.5
+
+For CUDA version 8.0
+export NVIDIA_GPU_DIRECT=${NVIDIA_GPU_DIRECT:-/usr/src/nvidia-367.48}
+
+For CUDA version 9.1
+export NVIDIA_GPU_DIRECT=${NVIDIA_GPU_DIRECT:-/usr/src/nvidia-387.26}
+
+For INTEL GPU DIRECT
+export INTEL_GPU_DIRECT=${INTEL_GPU_DIRECT:-$(realpath /usr/src/intel-dmabuf-dkms-* | head -1)}
+  path may be /usr/src/intel-dmabuf-dkms-prerelease/${DRIVER_VERSION} or /usr/src/intel-dmabuf-dkms/${DRIVER_VERSION}
+Make sure "${INTEL_GPU_DIRECT}/Module.symvers" and "${INTEL_GPU_DIRECT}/backport-include/backport/autoconf.h" exist.
+If they do not exist in the correct locations, then you will need to build them using the following commands:
+  export LEX=flex                 # may not be needed on SLES
+  export YACC=bison
+  cp defconfigs/dmabuf .config
+  make -j KLIB=/lib/modules/$(uname -r) olddefconfig
+  make -j KLIB=/lib/modules/$(uname -r)
+
+To support MLNX_OFED, download and install the latest MLNX_OFED for the distro on your machine.
+Make sure to add the option "--add-kernel-support" to rebuild the package to the given kernel revison:
+  ./mlnxofedinstall --add-kernel-support
+Export the path to MLNX_OFED source directory:
+  export MOFED_PATH=${MOFED_PATH:-/usr/src/ofa_kernel/x86_64/4.18.0-339.el8.x86_64}
+For now, MLNX_OFED is supported only on RHEL 7.9, RHEL 8.5, SLES 15.2, and SLES 15.3.
+
+Make sure you clear out the tmp directory before rebuilding
+
+Once the SRC RPM is created, build the binary RPM from ./tmp/rpmbuild directory execute the following command
+
+rpmbuild --rebuild --define "_topdir $(pwd)" --nodeps SRPMS/*.src.rpm
+
