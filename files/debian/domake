@@ -1,0 +1,23 @@
+#!/bin/bash
+
+# domake: helper script to prepare environment and then run the make
+# for the rv module
+if [ -z "$kver" ]; then
+	export kver=$(uname -r);
+fi
+if [ -z "$kbuild" ]; then
+	export kbuild=/lib/modules/$kver/build
+fi
+if [ -f "$kbuild/include/config/kernel.release" ]; then
+	export kver=$(cat $kbuild/include/config/kernel.release)
+else
+	export kver=fail
+fi
+export modlist="@MODLIST@"
+export mversion=@MVERSION@
+if [ -z "$mversion" ]; then
+	make -j 8 CONFIG_INFINIBAND_RV=m KDIR=/usr/src/linux-headers-$kver M=$(pwd);
+else
+	make -j 8 MVERSION=\"$mversion\" CONFIG_INFINIBAND_RV=m KDIR=/usr/src/linux-headers-$kver M=$(pwd)
+fi
+
