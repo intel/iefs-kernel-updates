@@ -1,0 +1,14 @@
+Building the software
+
+Software can be built either as RPM or DEB package. Two building scripts are provided:
+./do-update-makerpm.sh and ./do-update-makedeb.sh which build RPM and DEB packages respectively
+
+Please refer README for RPM build instructions
+
+To build CPU-only package
+	1. rm -rf <BUILD_DIR>
+	2. ./do-update-makedeb.sh -S <SRC_DIR> -w <BUILD_DIR>
+	Example:
+		rm -rf ${PWD}/tmp; ./do-update-makedeb.sh -S ${PWD} -w ${PWD}/tmp
+
+DEB build output contains both source and binary packages.
