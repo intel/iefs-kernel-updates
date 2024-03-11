@@ -1,0 +1,18 @@
+#!/bin/bash
+# postinst script for @DEBNAME@
+#
+# see: dh_installdeb(1)
+
+set -e
+kbase=$(echo $kver | sed -ne 's/-.*//p')
+
+dkms add -m @DEBNAME@ -v @DEBRELEASE@ || :
+for kd in /lib/modules/${kbase}*; do
+	bdir="${kd}/build";
+	kv=$(echo $kd | cut -d '/' -f 4);
+	if [ -e $bdir ]; then
+		dkms install -m @DEBNAME@ -v @DEBRELEASE@ -k ${kv} --force || :
+	else
+		echo "SKIP ${kv}: Headers not found";
+	fi
+done
