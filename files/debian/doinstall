@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# doinstall: helper script to install the rv module
+# expected argument: stage directory
+# expected environment: 
+#    KERNEL_MOD_SIGNING_ENABLED=0/1
+#    KERNEL_MOD_SIGNING_TOOL=/full/path/to/signing/tool
+
+
+set -Eeuo pipefail
+
+function error_exit()
+{
+	echo "$(basename $0) FAILED"
+}
+trap 'error_exit' ERR
+
+CURDIR=$1
+
+if [ "${KERNEL_MOD_SIGNING_ENABLED:-}" == "1" ]; then
+	${KERNEL_MOD_SIGNING_TOOL} ${CURDIR}/rv/rv.ko
+fi
+
+if [ -z ${kver} ]; then
+	echo "kver environment variable must be set"
+	exit 1
+fi
+
+drv_location=${CURDIR}/lib/modules/${kver}/extra/iefs-kernel-updates
+src_location=${CURDIR}/usr/src/iefs-kernel-updates-@DEBRELEASE@
+hdr_location=/usr/src/linux-headers-${kver}
+
+mkdir -p ${drv_location}
+cp ${CURDIR}/rv/rv.ko ${drv_location}
+mkdir -p ${CURDIR}/etc/depmod.d
+cp ${CURDIR}/iefs-kernel-updates.conf ${CURDIR}/etc/depmod.d
+mkdir -p ${CURDIR}/etc/modules-load.d
+cp ${CURDIR}/modules-load.conf ${CURDIR}/etc/modules-load.d/iefs-kernel-updates.conf
+mkdir -p ${src_location}/rv_default
+cp ${CURDIR}/modules.order ${src_location}/rv_default
+cp ${CURDIR}/rv/*.* ${CURDIR}/rv/.*.cmd ${CURDIR}/rv/Makefile ${src_location}/rv_default
+mkdir -p ${src_location}/include/uapi/rdma
+cp ${CURDIR}/rv/rv_user_ioctls.h ${src_location}/include/uapi/rdma
+cp -r ${CURDIR}/{LICENSE,Makefile,Module.symvers,compat,dkms.conf,include,modules.order} ${src_location}
+(
+	cd ${hdr_location}/scripts
+	if [ ! -f unifdef ]; then
+		/usr/bin/gcc unifdef.c -o unifdef
+	fi
+)
+(
+	cd ${hdr_location};
+	sh -x ./scripts/headers_install.sh \
+		${CURDIR}/rv/rv_user_ioctls.h \
+		${src_location}/include/uapi/rdma/rv_user_ioctls.h
+)
+mkdir -p ${CURDIR}/usr/include/rdma
+cp ${CURDIR}/rv/rv_user_ioctls.h ${CURDIR}/usr/include/rdma
+(cd ${src_location}; ln -s rv_default rv)
+
+echo "doinstall finished"
+
+exit 0
+
+
