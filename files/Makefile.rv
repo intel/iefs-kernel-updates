@@ -1,0 +1,50 @@
+#
+# rdmavt module
+#
+#
+# Called from the kernel module build system.
+#
+ifneq ($(KERNELRELEASE),)
+#kbuild part of makefile
+
+ifneq ($(MOFED_PATH),)
+NOSTDINC_FLAGS += -I$(MOFED_PATH)/include -I$(MOFED_PATH)/include/uapi -DHAVE_MOFED
+# For SLES 15.2, we need to have the following define to build.
+ifeq ("$(KERNELRELEASE)","5.3.18-22-default")
+NOSTDINC_FLAGS += -DHAVE_TC_SETUP_FLOW_ACTION
+endif
+# Get the major version
+MOFED_VER ?= $(shell cat $(MOFED_PATH)/compat_base | cut -d '-' -f 4)
+MAJ_VER = $(shell echo $(MOFED_VER) | cut -c3-4)
+MIN_VER = $(shell echo $(MOFED_VER) | cut -c5-6)
+$(info *** Detected MOFED_VER: $(MOFED_VER) ($(MAJ_VER).$(MIN_VER)) *** )
+NOSTDINC_FLAGS += -DMOFED_MJVER=$(MAJ_VER)
+NOSTDINC_FLAGS += -DMOFED_MINVER=$(MIN_VER)
+endif
+NOSTDINC_FLAGS += -I${M}/include -I${M}/compat
+
+obj-$(CONFIG_INFINIBAND_RV) += rv.o
+
+rv-y := rv_main.o rv_file.o rv_mr_cache.o trace.o compat_common.o compat.o \
+	rv_mr.o rv_rdma.o rv_conn.o
+
+CFLAGS_trace.o = -I$(src)
+ifdef MVERSION
+CFLAGS_rv_main.o = -DRV_DRIVER_VERSION_BASE=\"$(MVERSION)\"
+endif
+
+else
+#normal makefile
+kver ?= `uname -r`
+KDIR ?= /lib/modules/$(kver)/build
+
+default:
+	$(MAKE) -C $(KDIR) M=$$PWD CONFIG_INFINIBAND_RV=m NOSTDINC_FLAGS=-I$$PWD
+
+clean:
+	$(MAKE) -C $(KDIR) M=$$PWD clean
+
+install:
+	$(MAKE) INSTALL_MOD_DIR=updates -C $(KDIR) M=$$PWD modules_install
+
+endif

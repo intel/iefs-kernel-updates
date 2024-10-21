@@ -1,0 +1,23 @@
+Source: @DEBNAME@
+Section: unknown
+Priority: optional
+Maintainer: https://www.intel.com/content/www/us/en/support.html
+Build-Depends: debhelper (>= 12~), linux-headers
+Standards-Version: 4.5.1
+Homepage: https://github.com/intel/iefs-kernel-updates
+Rules-Requires-Root: no
+
+Package: kmod-@DEBNAME@
+Architecture: linux-any
+Depends: ${misc:Depends}, linux-image
+Description: Updated kernel modules for Intel Ethernet Fabric Suite
+
+Package: @DEBNAME@-devel
+Architecture: linux-any
+Depends: ${misc:Depends}
+Description: Development header files for Intel Ethernet Fabric Suite
+
+Package: @DEBNAME@-dkms
+Architecture: linux-any
+Depends: ${misc:Depends}, dkms
+Description: Updated kernel modules for Intel Ethernet Fabric Suite
