@@ -1,0 +1,8 @@
+#!/bin/bash
+# prerm script for @DEBNAME@
+#
+# see: dh_installdeb(1)
+
+set -e
+
+dkms remove -m @DEBNAME@ -v @DEBRELEASE@ --all || :
