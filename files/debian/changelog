@@ -1,0 +1,11 @@
+@DEBNAME@ (@DEBVERSION@-@DEBRELEASE@) unstable; urgency=medium
+
+  * Update dkms post install logic to build for all possible kernels
+
+ -- Adam Goldman <adam.goldman@intel.com> Thu, 05 Oct 2023 10:03:12 +0000
+
+iefs-kernel-updates (5.15.0.25-6290) unstable; urgency=medium
+
+  * Initial release 
+
+ -- sbreyer <scott.breyer@intel.com>  Wed, 09 Mar 2022 21:24:12 +0000
