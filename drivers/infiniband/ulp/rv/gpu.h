@@ -53,7 +53,11 @@ static inline int num_user_pages_gpu(u64 addr, u64 len)
 #include <linux/dma-resv.h>
 
 #ifdef MODULE_IMPORT_NS_DMA_BUF_FOR_INTEL_GPU_DIRECT
+#ifdef MODULE_IMPORT_NS_HAS_STRING
 MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif
 #endif
 
 #define INTEL_GPU_PAGE_SHIFT 12
