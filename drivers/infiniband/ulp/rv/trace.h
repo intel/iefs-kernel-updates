@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
+#include "compat.h"
 #include "trace_mr_cache.h"
 #include "trace_conn.h"
 #include "trace_dev.h"
 #include "trace_mr.h"
 #include "trace_user.h"
 #include "trace_rdma.h"
-#include "trace_misc.h"
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+#include "trace_gpu.h"
+#endif

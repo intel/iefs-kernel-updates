@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 #if !defined(__RV_TRACE_CONN_H) || defined(TRACE_HEADER_MULTI_READ)
 #define __RV_TRACE_CONN_H
@@ -14,17 +14,17 @@
 #define RV_CONN_REQ_PRN  "rem_addr 0x%x global %u sgid_inx %u port_num %u " \
 			 "dlid 0x%x dgid 0x%llx %llx"
 
-#define RV_CONN_PRN  "Conn 0x%p rem_addr 0x%x global %u dlid 0x%x " \
-		     "dgid 0x%llx %llx num_conn %u next %u jdev 0x%p " \
+#define RV_CONN_PRN  "Conn 0x%pK rem_addr 0x%x global %u dlid 0x%x " \
+		     "dgid 0x%llx %llx num_conn %u next %u jdev 0x%pK " \
 		     "refcount %u"
 
-#define RV_JDEV_PRN "jdev 0x%p dev %p num_conn %u index_bits %u " \
+#define RV_JDEV_PRN "jdev 0x%pK dev %pK num_conn %u index_bits %u " \
 		    "loc_gid_index %u loc addr 0x%x jkey_len %u " \
 		    "jkey 0x%s sid 0x%llx q_depth %u ua_next %u "\
 		    "refcount %u"
 
-#define RV_SCONN_PRN "sconn %p index %u qp 0x%x conn %p flags 0x%x state %u " \
-		     "cm_id %p retry %u"
+#define RV_SCONN_PRN "sconn %pK index %u qp 0x%x conn %pK flags 0x%x state %u " \
+		     "cm_id %pK retry %u"
 
 DECLARE_EVENT_CLASS(/* listener */
 	rv_listener_template,
@@ -36,7 +36,11 @@ DECLARE_EVENT_CLASS(/* listener */
 		__field(u32, count)
 	),
 	TP_fast_assign(/* assign */
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(name);
+#else
 		__assign_str(name, dev_name);
+#endif
 		__entry->sid = svc_id;
 		__entry->count = refcount;
 	),
@@ -195,7 +199,11 @@ DECLARE_EVENT_CLASS(/* jdev */
 	),
 	TP_fast_assign(/* assign */
 		__entry->ptr = ptr;
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(name);
+#else
 		__assign_str(name, dev_name);
+#endif
 		__entry->num_conn = num_conn;
 		__entry->index_bits = index_bits;
 		__entry->loc_gid_index = loc_gid_index;
@@ -346,7 +354,14 @@ DEFINE_EVENT(/* event */
 );
 
 DEFINE_EVENT(/* event */
-	rv_sconn_template, rv_sconn_drain_done,
+	rv_sconn_template, rv_sconn_rq_drain_done,
+	TP_PROTO(void *ptr, u8 index, u32 qp_num, void *conn, u32 flags,
+		 u32 state, void *cm_id, u32 retry),
+	TP_ARGS(ptr, index, qp_num, conn, flags, state, cm_id, retry)
+);
+
+DEFINE_EVENT(/* event */
+	rv_sconn_template, rv_sconn_sq_drain_done,
 	TP_PROTO(void *ptr, u8 index, u32 qp_num, void *conn, u32 flags,
 		 u32 state, void *cm_id, u32 retry),
 	TP_ARGS(ptr, index, qp_num, conn, flags, state, cm_id, retry)
@@ -428,7 +443,11 @@ DECLARE_EVENT_CLASS(/* msg */
 	TP_fast_assign(/* assign */
 		__entry->ptr = ptr;
 		__entry->index = index;
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(msg);
+#else
 		__assign_str(msg, msg);
+#endif
 		__entry->d1 = d1;
 		__entry->d2 = d2;
 	),
@@ -507,6 +526,42 @@ DEFINE_EVENT(/* event */
 	TP_PROTO(void *ptr, u8 index, const char *msg, u64 d1, u64 d2),
 	TP_ARGS(ptr, index, msg, d1, d2)
 );
+
+DECLARE_EVENT_CLASS(/* msg */
+	rv_conn_msg_template,
+	TP_PROTO(int inx, const char *msg, u64 d1, u64 d2),
+	TP_ARGS(inx, msg, d1, d2),
+	TP_STRUCT__entry(/* entry */
+		__field(int, inx)
+		__string(msg, msg)
+		__field(u64, d1)
+		__field(u64, d2)
+	),
+	TP_fast_assign(/* assign */
+		__entry->inx = inx;
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(msg);
+#else
+		__assign_str(msg, msg);
+#endif
+		__entry->d1 = d1;
+		__entry->d2 = d2;
+	),
+	TP_printk(/* print */
+		"inx %u: %s 0x%llx 0x%llx",
+		__entry->inx,
+		__get_str(msg),
+		__entry->d1,
+		__entry->d2
+	)
+);
+
+DEFINE_EVENT(/* event */
+	rv_conn_msg_template, rv_conn_msg_query_qp_state,
+	TP_PROTO(int inx, const char *msg, u64 d1, u64 d2),
+	TP_ARGS(inx, msg, d1, d2)
+);
+
 #endif /* __RV_TRACE_CONN_H */
 
 #undef TRACE_INCLUDE_PATH

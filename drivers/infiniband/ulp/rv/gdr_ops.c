@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  *
  * This file includes code obtained from: https://github.com/NVIDIA/gdrcopy/
  * under the following copyright and license.
@@ -33,162 +33,398 @@
 #include <linux/aio.h>
 #include <linux/bitmap.h>
 #include <linux/file.h>
-#include <linux/list.h>
 #include <linux/mm.h>
+#include <linux/mmu_context.h>
+#include <linux/sched/mm.h>
 #include <linux/mman.h>
 #include <linux/sched.h>
 #include <linux/io.h>
 #include <linux/slab.h>
+#include <linux/pci.h>
 
 #include <rdma/ib.h>
 
-#include "rv_mr_cache.h"
-#include "nv-p2p.h"
+#include "rv.h"
 #include "gpu.h"
-#include "gdr_ops.h"
-#include "rv_user_ioctls.h"
+#include "trace.h"
 
-static int gdr_major;
-static struct class *gdr_class;
-static struct device *gdr_device;
-static dev_t gdr_dev;
-
-#define GDR_DRIVER_NAME "rv_gdr_chr"
-#define GDR_CLASS_NAME "rv_gdr"
-#define GDR_DEV_NAME "rv_gdr"
-
-/**
- * struct rv_gdrdata - Private data for gdr operations driver
- * @ioctl_busy_flag - an atomic used to serialize gdr device ioctl operations.
- * @gdr_cache - Cache of gpu memory buffer descriptors in a red/black tree
- * @map_this_mr - A memory descriptor pointer to be mmapped by this driver.
- * @mr_lock - a mutex for resolving races with the Nvidia callback handler.
- * @gdr_wq - A work queue to delete nodes from the delete list.
- * @n_pages_locked - Total number of pages pinned in the cache.
- * @lru_list - Head of the LRU list.
- *
- * A file descriptor's private_data field point to one of these structures.
- * Most of the state in this structure is manipulated through this driver's
- * ioctl() system call handler.
- *
- * It maintains a red/black tree and mutex lock for all the pinned
- * and mmapped gpu buffers created.
- *
- * The ioctl_busy_flag is used to ensure that only one thread
- * at a time is executing in this ioctl() handler.  Any thread that enters
- * this ioctl() handler while it is "busy", will receive an -EINVAL error code.
- * This means there is no concurrent execution of most of the code in this
- * driver.  This is acceptable because the primary user of this driver is PSM,
- * and the core of PSM is single-threaded.
- *
- * The mr_lock mutex serializes access to this red/black tree as well
- * as all state information for each of the pinned GPU buffers.
- *
- * map_this_mr is used as a way to efficiently communicate across
- * the vm_mmap() function call in do_pin_and_mmap_gpu_buf() to this
- * driver's mmap handler function rv_gdr_mmap(), a pointer to a
- * gdr_mr struct that describes the GPU buffer that is to be mmapped
- * into the process's user virtual adddress space.
+/*
+ * Default PSM limit is (TF_NFLOWS(32) + num_send_rdma(128)) * window_rv(2M)
+ * So ideal GPU cache is > 320MB, however PSM can survive with less
+ * Real limit here is GPU BAR space and GPU memory size
  */
-struct rv_gdrdata {
-	atomic_t ioctl_busy_flag;
-	struct rv_mr_cache *gdr_cache;
-	void *map_this_mr;	/* consider replacing with a linked list */
-	struct mutex mr_lock;
-	struct workqueue_struct *gdr_wq;
-	unsigned long n_pages_locked;
-	struct list_head lru_list;
-};
+unsigned int gpu_rdma_cache_size = 1024; /* this is MB */
+module_param(gpu_rdma_cache_size, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(gpu_rdma_cache_size, "Size of gpu pin/mr (including RDMA) cache (in MB)");
+
+/* when PSM is not using large window_sz RDMA, we can get by w/ smaller cache */
+unsigned int gpu_cache_size = 256; /* this is MB */
+module_param(gpu_cache_size, uint, S_IRUGO | S_IWUSR);
+MODULE_PARM_DESC(gpu_cache_size, "Size of gpu pin/mr cache (in MB)");
 
 /**
  * struct gdr_mr - describes a gpu buffer and it's pinned and mmaped state.
- * @mrc: This memory region's place holder in the RB tree of cached
- *	     memory region structures. This contains the starting address
- *	     and length of a gpu buffer.
- * @list: List entry for adding to a list.
- * @host_addr: if not NULL, it is the host address mapping of this gpu buffer.
- * @mr_handle: a pseudo-random number used by this driver's mmap_handler
- * @page_table: When a GPU buf is pinned this points to that GPU buf's
- *		NVidia page table.
- * @gd: A pointer to the rv_gdrdata this structure is linked to.
- * @ref_cnt: A reference count on this structure.
+ * A given gdr_mr can be mmap'ed for gdrcpy or registered for RDMA or both.
+ * The gdr_mr in either case is tracked in a single gdrdata.cache per open.
  *
- * Each struct gdr_mr represents a mmapped and pinned gpu buffer.
- * The rv_gdrdata structure for this driver contains the head of
- * a read/black tree of these these structures.  Access to and modification
- * of the read/black tree and the content of structures in this structure
- * are controlled by the mr_lock mutex in the rv_gdrdata structure.
+ * @mrc: The rv_mr_cache entry information and optional verbs RDMA MR
+ *	mrc.mr is protected by gdrdata.mr_lock.
+ * @host_addr: if not NULL, it is the host address mapping of this gpu buffer.
+ *	protected by gdrdata.mr_lock
+ * @mr_handle: a pseudo-random number used by this driver's mmap_handler to
+ *	identify this gmr.  Used as a confirmation mmap is working on the
+ *	expected gmr. Immutable.
+ * @page_table: The GPU buf's NVidia page table with pinned pages
+ *	Except in midst of create or destroy always has list of pinned pages, so
+ *	page_table is essentally immutable and does not need gdrdata.mr_lock.
+ * @dma_mapping: The mapped DMA addresses for the GPU pages in page_table.
+ * #ipc_handle: IPC handle for dma_buf (intel GPU)
+ * @ref_cnt: A reference count on this structure.
+ * @gd: The gdrdata and GPU cache this gdr_mr is part of (set NULL during
+ *	destroy once we reach point gd and gd->mr_lock no longer are needed)
+ *	otherwise immutable.
+ * @lock: protects free_callback access to gd and changes to gd->refcount for
+ *	this gdr_mr
+ *
+ * gdrdata.mr_lock's main goal is to protect against free_callback races with
+ * ioctl's.  As such this is held during all cache calls which might call
+ * ops->remove as well as all initialization of gdr_mr.mrc.mr and
+ * gdr_mr.host_addr.  free_callback's wait for gdr_mr.mrc.entry.refcount == 0
+ * also prevents races on using the verbs MR.
+ *
+ * gdr_mr.ref_cnt <= 2
+ *	1 ref_cnt for entry on GPU cache (or while creating for insert)
+ *	1 ref_cnt for potential free_callback
+ *	cache entry usage for IOs tracked with gdr_mr.mrc_entry.refcount
+ * The verbs MR and mmap'ing are not taken away until on path to destroy
+ *	NIC MR is always taken away when remove from cache.
+ *	The mmap and put_pages are attempted on cache remove, but may be
+ *	deferred to free_callback if called in non-user context.
+ *	Unpinning GPU pages may also be deferred to free_callback
+ *	if put_pages races with free.
+ *	The free_callback may occur after deinit so we need to allow a gdr_mr
+ *	to exist in this state after gdrdata and gpu_data is gone.
+ * To handle the potential for a free_callback after cache deinit, the
+ * gdr_mr.gd is set to NULL when removing the gdr_mr from the cache.  The
+ * gdr_mr.lock protects this operation.  If a check of gdr_mr.gd returns
+ * NULL (within gdr_mr.lock), the function checking can be assured the
+ * gdr_mr is no longer in the cache and no longer has an MR or mmap.
  */
 struct gdr_mr {
 	struct rv_mr_cached mrc;
-	struct list_head list;
-	u64 host_addr;
-	u32 mr_handle;
+	spinlock_t lock; /* see above */
+	struct rv_gdrdata *gd;	/* valid until removed from cache */
+
+	u64 host_addr;		/* for mmap */
+	u32 mr_handle;		/* for mmap */
+
+#ifdef NVIDIA_GPU_DIRECT
 	nvidia_p2p_page_table_t *page_table;
-	struct rv_gdrdata *gd;
+	struct nvidia_p2p_dma_mapping *dma_mapping;
+#elif defined(INTEL_GPU_DIRECT)
+	u32 ipc_handle;
+	struct dma_buf *dbuf;
+	struct dma_buf_attachment *dat;
+	struct sg_table *sg_table;
+	u64 alloc_id;
+	u64 base_addr;
+#endif
 	struct kref ref_cnt;
+	int rv_inx;
 };
+
+static inline void gdr_mr_put(struct gdr_mr *gmr);
+static inline void gdr_mr_get(struct gdr_mr *gmr);
+static void gdr_mr_put_gd(struct gdr_mr *gmr);
+static void gdr_cache_mrce_remove(struct rv_mr_cache *cache, void *context,
+				  struct rv_mr_cache_entry *mrce,
+				  int is_invalidate);
+
+#ifdef NVIDIA_GPU_DIRECT
+static void gdr_mr_put_pages(struct gdr_mr *gmr);
+static void gdrdrv_get_pages_free_callback(void *data);
+
+static int pin_gpu_buf(struct gdr_mr *gmr)
+{
+	int ret;
+
+	gdr_mr_get(gmr);	/* 2nd ref for free_callback */
+	ret = get_gpu_pages(gmr->mrc.entry.addr, gmr->mrc.entry.len,
+			    &gmr->page_table, gdrdrv_get_pages_free_callback,
+			    gmr);
+	trace_rv_gdr_msg_pin_gpu_buf(gmr->rv_inx, "page_table, mm",
+				     (u64)gmr->page_table, (u64)current->mm);
+	if (ret) {
+		trace_rv_gdr_msg_pin_gpu_buf(gmr->rv_inx,
+					     "failed to pin pages: size, ret",
+					     gmr->mrc.entry.len, (u64)ret);
+		/*
+		 * Occasionally the page_table may be set. In this case, we
+		 * should ignore and reset the pointer to avoid trigger
+		 * WARN_ON during cleanup.
+		 */
+		gmr->page_table = NULL;
+		/*
+		 * nVidia doc says nvidia_p2p_get_pages returns -EINVAL for
+		 * bad arg.  However may return -EINVAL if not enough GPU BAR
+		 */
+		if (ret == -EINVAL)
+			ret = -ENOMEM;
+		gdr_mr_put(gmr); /* free_callback's ref */
+		gmr->gd->stats.failed_pin++;
+		return ret;
+	}
+	trace_rv_gdr_msg_pin_gpu_buf(gmr->rv_inx, "entries, pages",
+				     gmr->page_table->entries,
+				     (u64)gmr->page_table->pages);
+
+#ifdef NVIDIA_P2P_PAGE_TABLE_VERSION_COMPATIBLE
+	if (!NVIDIA_P2P_PAGE_TABLE_VERSION_COMPATIBLE(gmr->page_table)) {
+		rv_err(gmr->rv_inx,
+		       "get_pages incompatible page table version\n");
+		ret = -EOPNOTSUPP;
+		gmr->gd->stats.failed_pin++;
+		goto bail_unpin;
+	}
+#endif
+	/*
+	 * nVidia defines 4K and 128K possible page sizes, but sample code
+	 * assumes 64K
+	 */
+	if (gmr->page_table->page_size != NVIDIA_P2P_PAGE_SIZE_64KB) {
+		rv_err(gmr->rv_inx, "get_pages unexpected page size %d\n",
+		       gmr->page_table->page_size);
+		ret = -EOPNOTSUPP;
+		gmr->gd->stats.failed_pin++;
+		goto bail_unpin;
+	}
+	return 0;
+
+bail_unpin:
+	/* The following will call gdr_mr_put() once */
+	mutex_unlock(&gmr->gd->mr_lock);
+	gdr_mr_put_pages(gmr);
+	mutex_lock(&gmr->gd->mr_lock);
+	return ret;
+}
+
+#define pin_gpu_buf_mmap(gmr) pin_gpu_buf(gmr)
+
+static int pin_gpu_buf_promote(struct gdr_mr *gmr)
+{
+	int ret;
+	struct pci_dev *pdev = to_pci_dev(gmr->gd->ib_dev->dma_device);
+
+	ret = nvidia_p2p_dma_map_pages(pdev,
+				       gmr->page_table,
+				       &gmr->dma_mapping);
+	if (ret) {
+		rv_err(gmr->rv_inx, "dma_map_pages() failed: ret %d\n",
+		       ret);
+		gmr->dma_mapping = NULL;
+		goto bail_map;
+	}
+	if (!NVIDIA_P2P_DMA_MAPPING_VERSION_COMPATIBLE(gmr->dma_mapping)) {
+		rv_err(gmr->rv_inx, "incompat dma mapping version 0x%08x\n",
+		       gmr->dma_mapping->version);
+		nvidia_p2p_dma_unmap_pages(pdev, gmr->page_table,
+					   gmr->dma_mapping);
+		gmr->dma_mapping = NULL;
+		ret = -EINVAL;
+	}
+
+bail_map:
+	return ret;
+}
+
+static int pin_gpu_buf_mr(struct gdr_mr *gmr)
+{
+	int ret;
+
+	ret = pin_gpu_buf(gmr);
+	if (ret)
+		return ret;
+
+	ret = pin_gpu_buf_promote(gmr);
+	if (ret) {
+		/* Free the page table */
+		mutex_unlock(&gmr->gd->mr_lock);
+		gdr_mr_put_pages(gmr);
+		mutex_lock(&gmr->gd->mr_lock);
+	}
+
+	return ret;
+}
+
+#elif defined(INTEL_GPU_DIRECT)
+static int gpu_buf_get(struct gdr_mr *gmr)
+{
+	gmr->dbuf = dma_buf_get(gmr->ipc_handle);
+	if (IS_ERR(gmr->dbuf)) {
+		rv_err(gmr->rv_inx,
+		       "Failed to get dma_buf: ipc_handle %u ret %p (%ld)\n",
+		       gmr->ipc_handle, gmr->dbuf, PTR_ERR(gmr->dbuf));
+		gmr->dbuf = NULL;
+		gmr->gd->stats.failed_pin++;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+#define pin_gpu_buf_mmap(gmr) gpu_buf_get(gmr)
+
+static void
+rv_dmabuf_unsupported_move_notify(struct dma_buf_attachment *attach)
+{
+	struct gdr_mr *gmr = attach->importer_priv;
+
+	rv_err(gmr->rv_inx,
+	       "Invalidate callback should not be called when memory is pinned\n");
+}
+
+static struct dma_buf_attach_ops rv_dmabuf_attach_pinned_ops = {
+	.allow_peer2peer = true,
+	.move_notify = rv_dmabuf_unsupported_move_notify,
+};
+
+/* Promote mmap pin to mr pin */
+static int pin_gpu_buf_promote(struct gdr_mr *gmr)
+{
+	int ret = 0;
+
+	gmr->dat = dma_buf_dynamic_attach(gmr->dbuf,
+					  gmr->gd->ib_dev->dma_device,
+					  &rv_dmabuf_attach_pinned_ops, gmr);
+	if (IS_ERR(gmr->dat)) {
+		rv_err(gmr->rv_inx,
+		       "Failed to attach dma_buf: %p (ipc %u) ret %ld\n",
+		       gmr->dbuf, gmr->ipc_handle, PTR_ERR(gmr->dat));
+		gmr->dat = NULL;
+		ret = -EINVAL;
+		goto pin_out;
+	}
+
+	dma_resv_lock(gmr->dat->dmabuf->resv, NULL);
+	ret = dma_buf_pin(gmr->dat);
+	if (ret) {
+		rv_err(gmr->rv_inx, "Failed to pin dma_buf (ipc %u): %d\n",
+		       gmr->ipc_handle, ret);
+		goto dbuf_detach;
+	}
+
+	gmr->sg_table = dma_buf_map_attachment(gmr->dat, DMA_BIDIRECTIONAL);
+	if (IS_ERR(gmr->sg_table)) {
+		rv_err(gmr->rv_inx,
+		       "Failed to map attach for dbuf %p (ipc %u), ret %ld\n",
+		       gmr->dbuf, gmr->ipc_handle, PTR_ERR(gmr->sg_table));
+		gmr->sg_table = NULL;
+		ret = -EFAULT;
+		goto dbuf_unpin;
+	}
+	dma_resv_unlock(gmr->dat->dmabuf->resv);
+
+	return ret;
+
+dbuf_unpin:
+	dma_buf_unpin(gmr->dat);
+dbuf_detach:
+	dma_resv_unlock(gmr->dat->dmabuf->resv);
+	dma_buf_detach(gmr->dbuf, gmr->dat);
+	gmr->dat = NULL;
+pin_out:
+	gmr->gd->stats.failed_pin++;
+	return ret;
+}
+
+static int pin_gpu_buf_mr(struct gdr_mr *gmr)
+{
+	int ret;
+
+	ret = gpu_buf_get(gmr);
+	if (ret)
+		return ret;
+	ret = pin_gpu_buf_promote(gmr);
+	if (ret) {
+		/* Release the dma-buf */
+		dma_buf_put(gmr->dbuf);
+		gmr->dbuf = NULL;
+	}
+	return ret;
+}
+#endif /* INTEl_GPU_DIRECT */
 
 /**
  * gdrdrv_munmap() - unmap a pinned gpu page from process's address space.
- * @mr: - A pointer to a struct gdr_mr describing the gpu buf being unmapped.
+ * @gmr: - the gpu buf being unmapped.
  *
  * Unmap host_addr from the user's address space.
+ * gmr->host_addr must be non-NULL
  *
  * This could be called during process exit after a user-mode SEGFAULT.
  * Under this circumstance, we must not call vm_munmap(), otherwise the kernel
- * will segfault and panic.
+ * will segfault and panic.  Any fatal signal sets PF_EXITING and then removes
+ * current->mm.  We test both since current->mm is needed for vm_mmap and
+ * if EXITING is set mm is probably gone or soon will be
  *
+ * If we are called in a non-process context, such as during NIC remove_one
+ * we do nothing and let free_callback call this and hopefully cleanup.
+ * Worst case, the remove_one of segfault will be fatal and linux will
+ * vm_munmap as part of process exit.
  */
-static inline void gdrdrv_munmap(struct gdr_mr *mr)
+static inline void gdrdrv_munmap(struct gdr_mr *gmr)
 {
 	int unmap_ret = 0;
 
-	if (mr->host_addr && !(current->flags & PF_EXITING)) {
-		unmap_ret = vm_munmap(mr->host_addr, mr->mrc.len);
+	trace_rv_gdr_msg_munmap(gmr->rv_inx, "mm, flags", (u64)current->mm,
+				current->flags);
+	if (current->mm && !(current->flags & PF_EXITING)) {
+		unmap_ret = vm_munmap(gmr->host_addr, gmr->mrc.entry.len);
 		WARN_ON(unmap_ret);
+		gmr->host_addr = 0;
+	} else {
+		trace_rv_gdr_msg_munmap_skip(gmr->rv_inx, "skipped gmr, mm",
+					     (u64)gmr, (u64)current->mm);
 	}
-	mr->host_addr = 0;
+}
+
+/*
+ * When ref_cnt hits zero it implies gdr_mr is no longer in cache
+ * and no future free_callbacks coming
+ */
+static inline void mr_release(struct kref *kref)
+{
+	struct gdr_mr *gmr;
+
+	gmr = container_of(kref, struct gdr_mr, ref_cnt);
+	WARN_ON(gmr->gd); /* XXX drop this */
+	WARN_ON(!RB_EMPTY_NODE(&gmr->mrc.entry.node));	/* XXX drop this */
+	WARN_ON(gmr->mrc.entry.user_refcount);/* XXX drop this */
+	WARN_ON(gmr->mrc.entry.refcount);	/* XXX drop this */
+	WARN_ON(gmr->host_addr && current->mm);	/* XXX drop this */
+	WARN_ON(gmr->mrc.mr.ib_mr);	/* XXX drop this */
+#ifdef NVIDIA_GPU_DIRECT
+	WARN_ON(gmr->page_table);	/* XXX drop this */
+	trace_rv_gdr_mr_release(gmr->rv_inx, gmr->mrc.entry.addr,
+				gmr->mrc.entry.len, gmr->mrc.entry.access);
+#else
+	trace_rv_gdr_mr_release(gmr->rv_inx, gmr->mrc.entry.addr,
+				gmr->mrc.entry.len, gmr->alloc_id,
+				gmr->base_addr, gmr->mrc.entry.access,
+				gmr->ipc_handle);
+#endif
+	kfree(gmr);
 }
 
 static inline void
-mr_complete(struct kref *kref)
+gdr_mr_get(struct gdr_mr *gmr)
 {
-	struct gdr_mr *mr;
-	struct rv_gdrdata *gd;
-
-	mr = container_of(kref, struct gdr_mr, ref_cnt);
-	gd = mr->gd;
-	WARN_ON(gd->map_this_mr == mr);
-	/* XXX should we use rv_mr_cache_put so it stays in cache? */
-	rv_mr_cache_remove(mr->gd->gdr_cache, &mr->mrc);
-	list_del(&mr->list);
-	kfree(mr);
-	return;
+	kref_get(&gmr->ref_cnt);
 }
 
 static inline void
-acquire_callback_mr_ref(struct gdr_mr *mr)
+gdr_mr_put(struct gdr_mr *gmr)
 {
-	kref_get(&mr->ref_cnt);
-}
-
-static inline void
-release_callback_mr_ref(struct gdr_mr *mr)
-{
-	kref_put(&mr->ref_cnt, mr_complete);
-}
-
-static inline void
-acquire_ioctl_mr_ref(struct gdr_mr *mr)
-{
-	kref_get(&mr->ref_cnt);
-}
-
-static inline void
-release_ioctl_mr_ref(struct gdr_mr *mr)
-{
-	kref_put(&mr->ref_cnt, mr_complete);
+	kref_put(&gmr->ref_cnt, mr_release);
 }
 
 /**
@@ -201,7 +437,7 @@ release_ioctl_mr_ref(struct gdr_mr *mr)
  * This shifts left the 32-bit handle value to a "page-aligned" value that
  * can be passed as the offset argument to vm_mmap().  The vm_mmap()
  * function then shifts its offset argument 12 bits to the right
- * before passing assigning to the vm_pgoff member of the vm_area struct
+ * before assigning to the vm_pgoff member of the vm_area struct
  * that is passed to the mmap handler.
  *
  * This way, the vm_pgoff member contains the original 32-bit handle
@@ -215,155 +451,330 @@ handle_to_offset(u32 handle)
 	return (off_t)handle << PAGE_SHIFT;
 }
 
-/**
- * handle_from_vm_pgoff() - convert a vm_pgoff value to a 32-bit handle.
- * @pgoff: a page-aligned value passed into this driver's mmap handler.
- *
- * Convert the vm_pagoff value from the mmap handler's vm_area_struct into
- * a 32-bit handle value.
- *
- * Return: The unique 32-bit pseudo random value from the vm_mmap() argument.
- */
+/* convert a vm_pgoff value to a 32-bit handle */
 static inline u32
 handle_from_vm_pgoff(unsigned long pgoff)
 {
 	return (u32)pgoff;
 }
 
-/**
- * get_random_handle()
- *
- * Generate a pseudo-random handle value, to be used during mmap operations.
- *
- * Return: a 32-bit pseudo random value.
- */
+/* Generate a pseudo-random handle value, to be used during mmap operations. */
 static inline u32
 get_random_handle(void)
 {
 	return (u32)get_cycles();
 }
 
-/*
- * File operation functions
- */
-static int rv_gdr_open(struct inode *inode, struct file *fp);
-static int rv_gdr_release(struct inode *inode, struct file *fp);
-static int rv_gdr_mmap(struct file *fp, struct vm_area_struct *vma);
-static long rv_gdr_ioctl(struct file *fp, unsigned int cmd,
-			    unsigned long arg);
+static bool gdr_cache_mrce_filter(struct rv_mr_cache_entry *mrce, u64 addr,
+				  u64 len, u32 acc)
+{
+	/* Allow subregion match */
+	return mrce->addr <= addr &&
+	       (mrce->addr + mrce->len) >= (addr + len) &&
+	       mrce->access == acc;
+}
 
-static const struct file_operations rv_gdr_ops = {
-	.owner = THIS_MODULE,
-	.open = rv_gdr_open,
-	.release = rv_gdr_release,
-	.unlocked_ioctl = rv_gdr_ioctl,
-	.mmap = rv_gdr_mmap,
-	.llseek = noop_llseek,
+#ifdef NVIDIA_GPU_DIRECT
+/*
+ * no locks held.  Nvidia driver solves put_pages vs free_callback races
+ * so we can safely clear gdr_mr.page_table when put_pages returns success
+ */
+static void gdr_mr_put_pages(struct gdr_mr *gmr)
+{
+	struct rv_gdrdata *gd = gmr->gd;
+	int ret;
+
+	/*
+	 * put_pages requires the user's mm and tgid, otherwise it is a noop
+	 * but silently returns success. During some cleanup cases this is
+	 * called in a different context, in which case we must skip the
+	 * put_pages and depend on the free_callback
+	 */
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return;
+
+	trace_rv_gdr_mr_put_pages(gmr->rv_inx, gmr->mrc.entry.addr,
+				  gmr->mrc.entry.len, gmr->mrc.entry.access);
+	if (gmr->dma_mapping) {
+		struct pci_dev *pdev = to_pci_dev(gmr->gd->ib_dev->dma_device);
+
+		ret = nvidia_p2p_dma_unmap_pages(pdev, gmr->page_table,
+						 gmr->dma_mapping);
+		if (ret)
+			rv_err(gmr->rv_inx,  "dma_unmap_pages() failed: %d\n",
+			       ret);
+		else
+			gmr->dma_mapping = NULL;
+	}
+	/*
+	 * can race with free_callback. nvidia_p2p_put_pages() returns:
+	 * 0 - put_pages won race, pages unpinned, no future free_callback
+	 * -EINVAL - free_callback won race and will unpin pages
+	 * other - unknown errors
+	 */
+	ret = nvidia_p2p_put_pages(0, 0, gmr->mrc.entry.addr, gmr->page_table);
+	trace_rv_gdr_msg_put_pages(gmr->rv_inx, "ret, mm", ret,
+				   (u64)current->mm);
+	if (!ret) {
+		gmr->page_table = NULL;
+		gdr_mr_put(gmr);	/* for callback */
+	}
+}
+#endif /* NVIDIA_GPU_DIRECT */
+
+/* break reference from gdr_mr to parent gd */
+static void gdr_mr_put_gd(struct gdr_mr *gmr)
+{
+	struct rv_gdrdata *gd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&gmr->lock, flags);
+	gd = gmr->gd;
+	gmr->gd = NULL;
+	atomic_dec(&gd->refcount);
+	spin_unlock_irqrestore(&gmr->lock, flags);
+}
+
+#ifdef INTEL_GPU_DIRECT
+struct gdr_remove_gmr_work_item {
+	struct work_struct remove_gmr_work;
+	struct gdr_mr *gmr;
 };
 
-static bool gdr_cache_mrc_filter(struct rv_mr_cached *mrc, unsigned long addr,
-				 unsigned long len, unsigned int acc)
+/* no harm if hold gd->mr_lock, but not needed as
+ * the gmr and gmr->mr should have no more references to it and is on
+ * the path to destruction.  Note on INTEL_GPU_DIRECT gmr only ever
+ * has one reference and the gdr_invalidate which preceeded the mrce_remove
+ * confirmed no more mrc references and took it off MR cache so can't be
+ * found to add any other references.
+ */
+static void gdr_remove_gmr(struct gdr_mr *gmr)
 {
-	return (bool)(mrc->addr == addr);
+	if (gmr->mrc.mr.ib_mr) {
+		rv_drv_api_dereg_mem(&gmr->mrc.mr);
+		/* unlikely to fail, forced to leak MR if dereg fails */
+		memset(&gmr->mrc.mr, 0, sizeof(gmr->mrc.mr));
+	}
+	if (gmr->sg_table) {
+		dma_buf_unmap_attachment(gmr->dat, gmr->sg_table,
+					 DMA_BIDIRECTIONAL);
+		gmr->sg_table = NULL;
+	}
+	if (gmr->dat) {
+		dma_buf_unpin(gmr->dat);
+		dma_buf_detach(gmr->dbuf, gmr->dat);
+		gmr->dat = NULL;
+	}
+	if (gmr->dbuf) {
+		dma_buf_put(gmr->dbuf);
+		gmr->dbuf = NULL;
+	}
+	gdr_mr_put_gd(gmr);
+	gdr_mr_put(gmr);	/* for cache */
 }
 
-static void gdr_cache_mrc_get(void *arg, struct rv_mr_cached *mrc)
+/* worker for removing MR */
+static void gdr_handle_remove_gmr(struct work_struct *work)
 {
-}
 
-static int gdr_cache_mrc_put(void *arg, struct rv_mr_cached *mrc)
-{
-	return 0;
+	struct gdr_remove_gmr_work_item *item =  container_of(work,
+			struct gdr_remove_gmr_work_item, remove_gmr_work);
+	gdr_remove_gmr(item->gmr);
+	kfree(item);
 }
+#endif /* INTEL_GPU_DIRECT */
 
-static int gdr_cache_mrc_invalidate(void *arg, struct rv_mr_cached *mrc)
+/* by the time this is called, the entry is off the cache and will not
+ * be accessed by new cache searches nor future deinit.
+ * This function can be called from two paths:
+ * - from deinit (file close).
+ * - from free_callback.
+ * - from cache eviction (cache full or explicit evict ioctl).
+ * Caller must hold gd->mr_lock as this protects our freeing of gdr_mr.mrc.mr
+ * and gdr_mr.host_addr from races with free_callback.
+ *
+ * When called within free_callback, is_invalidate==1 and we avoid
+ * calling put_pages as this causes a WARN_ON in nvidia code.
+ *
+ * For other callers, free_callback can race with this and we expect
+ * put_pages to handle such races.
+ */
+static void gdr_cache_mrce_remove(struct rv_mr_cache *cache, void *context,
+				  struct rv_mr_cache_entry *mrce,
+				  int is_invalidate)
 {
-	return 0;
-}
+	struct gdr_mr *gmr = container_of(mrce, struct gdr_mr, mrc.entry);
+	struct rv_gdrdata *gd = (struct rv_gdrdata *)context;
 
-static int gdr_cache_mrc_evict(void *arg, struct rv_mr_cached *mrc,
-			       void *evict_arg, bool *stop)
-{
-	return 0;
+#ifdef INTEL_GPU_DIRECT
+	struct gdr_remove_gmr_work_item *item;
+
+	trace_rv_gdr_mr_mrce_remove(gmr->rv_inx, mrce->addr, mrce->len,
+				    gmr->alloc_id, gmr->base_addr,
+				    mrce->access, gmr->ipc_handle);
+#else
+	trace_rv_gdr_mr_mrce_remove(gmr->rv_inx, mrce->addr, mrce->len,
+				    mrce->access);
+#endif
+	trace_rv_gdr_msg_mrce_remove(gmr->rv_inx, "gmr, is_invalidate",
+				     (u64)gmr, is_invalidate);
+	WARN_ON(!RB_EMPTY_NODE(&mrce->node));	/* XXX drop this */
+	WARN_ON(mrce->user_refcount);	/* XXX drop this */
+	WARN_ON(mrce->refcount);	/* XXX drop this */
+	WARN_ON(gd != gmr->gd);	/* XXX drop this */
+	WARN_ON(gd->map_this_mr == gmr);	/* XXX drop this */
+	trace_rv_gdr_msg_mrce_remove(gmr->rv_inx, "gmr, gd->refcount", (u64)gmr,
+				     atomic_read(&gd->refcount));
+
+#ifdef NVIDIA_GPU_DIRECT
+	if (gmr->mrc.mr.ib_mr) {
+		rv_drv_api_dereg_mem(&gmr->mrc.mr);
+		/* unlikely to fail, forced to leak MR if dereg fails */
+		memset(&gmr->mrc.mr, 0, sizeof(gmr->mrc.mr));
+	}
+	if (gmr->host_addr)
+		gdrdrv_munmap(gmr);
+	if (!is_invalidate && gmr->page_table) {
+		mutex_unlock(&gd->mr_lock);
+		gdr_mr_put_pages(gmr);
+		mutex_lock(&gd->mr_lock);
+	}
+	gdr_mr_put_gd(gmr);
+	gdr_mr_put(gmr);	/* for cache */
+#elif defined(INTEL_GPU_DIRECT)
+	/* must do munmap in process context */
+	if (gmr->host_addr)
+		gdrdrv_munmap(gmr);
+	item = kzalloc(sizeof(*item), GFP_KERNEL);
+	if (item) {
+		INIT_WORK(&item->remove_gmr_work, gdr_handle_remove_gmr);
+		item->gmr = gmr;
+		rv_queue_work(&item->remove_gmr_work);
+	} else {
+		gdr_remove_gmr(gmr);
+	}
+#endif
 }
 
 static struct rv_mr_cache_ops gdr_cache_ops = {
-	.filter = gdr_cache_mrc_filter,
-	.get = gdr_cache_mrc_get,
-	.put = gdr_cache_mrc_put,
-	.invalidate = gdr_cache_mrc_invalidate,
-	.evict = gdr_cache_mrc_evict
+	.filter = gdr_cache_mrce_filter,
+	.remove = gdr_cache_mrce_remove,
 };
 
-/**
- * rv_gdr_open() - the open file_operations handler for this driver.
- * @inode: Pointer to an inode for this special file.
- * @filep: Pointer to an open file structure for this open instance.
- *
- * Allocate and initialize a rv_gdrdata structure.
- *
- * Return:
- * 0 -	success, -ENOMEM for a failed memory allocation.
- */
-static int rv_gdr_open(struct inode *inode, struct file *filep)
+int rv_gdr_init(int rv_inx, struct rv_gdrdata *gd, u8 gpu, u32 cache_size)
 {
-	int ret = 0;
+	int ret;
 
-#if 0
-	struct rv_gdrdata *gd;
-	struct rv_mr_cache *cache;
-
-	gd = kzalloc(sizeof(*gd), GFP_KERNEL);
-	if (!gd)
-		return -ENOMEM;
-
-	filep->private_data = gd;
+	gd->rv_inx = rv_inx;
+	atomic_set(&gd->ioctl_busy_flag, 0);
 	mutex_init(&gd->mr_lock);
+	atomic_set(&gd->refcount, 0);
+	memset(&gd->stats, 0, sizeof(gd->stats));
+	if (!(gpu & RV_RDMA_MODE_GPU))
+		return 0;
+	gd->tgid = get_pid(task_tgid(current));
+	if ((gpu & RV_RDMA_MODE_UPSIZE_GPU) && !cache_size)
+		cache_size = gpu_rdma_cache_size;
+	if (!cache_size)
+		cache_size = gpu_cache_size;
 
-	cache = kmalloc(sizeof(*cache), GFP_KERNEL);
-	if (!cache)
-		return -ENOMEM;
-
-	cache->root = RB_ROOT_CACHED;
-	cache->ops = &gdr_cache_ops;
-	cache->ops_arg = gd;
-	INIT_HLIST_NODE(&cache->mn.hlist);
-	spin_lock_init(&cache->lock);
-	cache->mn.ops = &mn_opts;
-	cache->mm = NULL;
-	INIT_WORK(&cache->del_work, handle_remove);
-	INIT_LIST_HEAD(&cache->del_list);
-	INIT_LIST_HEAD(&cache->lru_list);
-	cache->wq = wq;
-
-	ret = rv_mr_cache_register(gd, NULL, &gdr_cache_ops, gd->gdr_wq, cache);
-
+	ret = rv_mr_cache_init(rv_inx, 'g', &gd->cache, &gdr_cache_ops, gd,
+			       NULL, cache_size, 1);
 	if (ret) {
-		filep->private_data = NULL;
-		kfree(gd);
-		return ret;
+		put_pid(gd->tgid);
+		gd->tgid = NULL;
 	}
-
-	gd->gdr_cache = cache;
-
-	INIT_LIST_HEAD(&gd->lru_list);
-	gd->n_pages_locked = 0;
-#endif
 	return ret;
 }
 
+/*
+ * when GPUDirect RDMA is in use, this is called only after all IOs are done
+ * so rv_mr_cache_deinit will be able to evict all entries.
+ * deinit when part of a close can depend on file close to cleanup mm
+ * but when part of a remove_one user may still have open.
+ * In the rare case where detach_all is interrupted, this may wait for
+ * those MRs to release their references to gdrdata.
+ */
+void rv_gdr_deinit(int rv_inx, struct rv_gdrdata *gd)
+{
+	unsigned long sleep_time = msecs_to_jiffies(1);
+
+	if (rv_gdr_enabled(gd)) {
+		mutex_lock(&gd->mr_lock);
+		rv_mr_cache_deinit(rv_inx, &gd->cache);
+		mutex_unlock(&gd->mr_lock);
+
+		trace_rv_gdr_msg_deinit(gd->rv_inx, "wait for gd, refcount",
+					(u64)gd, atomic_read(&gd->refcount));
+		while (atomic_read(&gd->refcount))
+			schedule_timeout_interruptible(sleep_time);
+
+		WARN_ON(gd->map_this_mr);
+		trace_rv_gdr_msg_deinit(gd->rv_inx,
+					"done wait for gd, refcount",
+					(u64)gd, atomic_read(&gd->refcount));
+		put_pid(gd->tgid);
+		gd->tgid = NULL;
+	}
+}
+
+/* Invalidate a GPU MR cache entry.
+ * If the entry still has an IO in flight, it is marked as "freeing" and the
+ * lkey/rkey is invalidated so the IO will fail quickly as no one cares about
+ * the IO anymore. In this case -EBUSY is returned.
+ *
+ * Otherwise, the usual case, we simply remove it from the MR cache,
+ * and 0 is returned.
+ *
+ * caller must hold gd->mr_lock
+ */
+static int gdr_invalidate(struct rv_gdrdata *gd, struct gdr_mr *gmr)
+{
+	struct rv_user_mrs *umrs;
+
+#ifdef INTEL_GPU_DIRECT
+	trace_rv_gdr_mr_invalidate(gmr->rv_inx, gmr->mrc.entry.addr,
+				      gmr->mrc.entry.len, gmr->alloc_id,
+				      gmr->base_addr, gmr->mrc.entry.access,
+				      gmr->ipc_handle);
+#else
+	trace_rv_gdr_mr_invalidate(gmr->rv_inx, gmr->mrc.entry.addr,
+				      gmr->mrc.entry.len,
+				      gmr->mrc.entry.access);
+#endif
+	if (rv_mr_cache_evict_mrce(&gd->cache, &gmr->mrc.entry, 1)) {
+		if (gmr->mrc.mr.ib_mr) {
+			umrs = container_of(gd, struct rv_user_mrs, gdrdata);
+			rv_inv_gdr_rkey(umrs, gmr->mrc.entry.access,
+					gmr->mrc.mr.ib_mr->rkey);
+			gd->stats.inval_mr++;
+		}
+		return -EBUSY;
+	}
+
+#ifdef NVIDIA_GPU_DIRECT
+	/* the callback still has a reference to gmr, so gmr is valid */
+	WARN_ON(gmr->host_addr);
+	WARN_ON(gmr->mrc.mr.ib_mr);	/* XXX drop this */
+#else
+	/* gmr will have been freed, gmr ref count is never >1 */
+#endif
+	return 0;
+}
+
+#ifdef NVIDIA_GPU_DIRECT
 /**
  * gdrdrv_get_pages_free_callback() - Callback handler for unpinning a GPU buf.
  * @data: - A pointer to a struct gdr_mr describing the gpu buf being freed.
  *
  * This is a callback function that the Nvidia driver calls when
- * a user frees a GPU buffer that has been pinned. This function unmaps and
- * unpins that gpu buffer.
+ * a user frees a GPU buffer that has been pinned. This function waits for
+ * IOs to complete, removes the gdr_mr from tha cache, unmaps and
+ * unpins the gpu buffer.
  *
- * The GPU buffer can ALSO be unmmapped and unpinned through the
- * RV_IOCTL_GDR_GPU_MUNMAP_UNPIN ioctl, calling the nvidia_p2p_put_pages()
- * function. It's possible for that ioctl() operation to race with this
- * callback.
+ * The GPU buffer can ALSO be unmmapped and unpinned through eviction (in ioctl)
+ * or close (cache deinit) in which case gdr_cache_mrce_remove is called
+ * and may race with this routine.
  *
  * Ultimately, the nvidia_p2p_put_pages() function determines which code
  * path wins this race.  If nvidia_p2p_put_pages() "wins", then
@@ -371,396 +782,303 @@ static int rv_gdr_open(struct inode *inode, struct file *filep)
  * callback handler "wins", then nvidia_p2p_put_pages() will fail with an
  * -EINVAL error code.
  *
- *  Both this ioctl() function and this callback handler acquire
- *  the mr_lock mutex to serialize operations on the memory mapping
- *  of this GPU buf. So it's important that the ioctl() function release
- *  this mr_lock BEFORE calling nvidia_p2p_put_pages(), otherwise that
- *  ioctl() function could deadlock on that mutex with this callback handler.
+ * In some situations, such as an app segfault or a device removal, the
+ * gdr_cache_mrce_remove may be called in a non-user context, in which case
+ * vm_munmap and nvidia_p2p_put_pages cannot be called.  In this case, the
+ * remove will break the association with gdrdata, free the verbs MR and depend
+ * on this callback to vm_munmap and free the pages.
+ * In this case mr_lock is not needed by this callback (and is not available).
  *
- *  mr->page_table SHOULD NEVER be NULL when this function is entered.
- *  If that happens, it indicates a bug either in this driver, or in
- *  the NVidia driver.  But out of a sense of parania, we WARN on this
- *  case, and call free_gpu_page_table() ONLY when this pointer is NOT
- *  NULL.
+ * To prevent deadlocks, nvidia_p2p_put_pages cannot be called while
+ * holding any locks this might acquire (such as gdrdata.mr_lock).
+ *
+ * nvidia_p2p_put_pages solves races with free_callback, so once we
+ * get here we know gdr_cache_mrce_remove will not be freeing gdr_mr.page_table.
+ *
+ * gdr_mr.page_table SHOULD NEVER be NULL when this function is entered.
+ * If that happens, it indicates a bug either in this driver, or in
+ * the NVidia driver.  But out of a sense of parania, we WARN on this
+ * case, and call free_gpu_page_table() ONLY when this pointer is NOT
+ * NULL.
+ *
+ * Typically nvidia caller will have set current->mm
  */
 static void gdrdrv_get_pages_free_callback(void *data)
 {
+	struct gdr_mr *gmr = data;
 	struct rv_gdrdata *gd;
-	struct gdr_mr *mr = data;
-	unsigned int npages;
+	unsigned long flags;
 
-	gd = mr->gd;
-	mutex_lock(&gd->mr_lock);
-	gdrdrv_munmap(mr);
+	/* Sanity Check */
+	if (!gmr || !gmr->page_table)
+		return;
 
-	/*
-	 * mr->page_table SHOULD NEVER be NULL in this code, but see comment
-	 * above about paranoia.
-	 */
-	WARN_ON(!mr->page_table);
-	if (mr->page_table) {
-		free_gpu_page_table(mr->page_table);
-		mr->page_table = NULL;
-		npages = num_user_pages_gpu(mr->mrc.addr, mr->mrc.len);
-		gd->n_pages_locked -= npages;
+	trace_rv_gdr_mr_free_callback(gmr->rv_inx, gmr->mrc.entry.addr,
+				      gmr->mrc.entry.len,
+				      gmr->mrc.entry.access);
+	trace_rv_gdr_msg_free_callback(gmr->rv_inx, "gmr, mm", (u64)gmr,
+				       (u64)current->mm);
+	spin_lock_irqsave(&gmr->lock, flags);
+	gd = gmr->gd;
+	if (gd) {
+		atomic_inc(&gd->refcount);
+		spin_unlock_irqrestore(&gmr->lock, flags);
+		/*
+		 * If the MR is still being referenced, invalidate the
+		 * lkey/rkey and keep the MR.
+		 */
+		mutex_lock(&gd->mr_lock);
+		if (gdr_invalidate(gd, gmr) )
+			goto free_exit;
+	} else {
+		spin_unlock_irqrestore(&gmr->lock, flags);
 	}
-	release_callback_mr_ref(mr);
-	mutex_unlock(&gd->mr_lock);
+	WARN_ON(!RB_EMPTY_NODE(&gmr->mrc.entry.node)); /* XXX drop this */
+free_exit:
+	if (gmr->host_addr)
+		gdrdrv_munmap(gmr);
+	if (gmr->dma_mapping) {
+		nvidia_p2p_free_dma_mapping(gmr->dma_mapping);
+		gmr->dma_mapping = NULL;
+	}
+	WARN_ON(!gmr->page_table);
+	if (gmr->page_table) {
+		free_gpu_page_table(gmr->page_table);
+		gmr->page_table = NULL;
+	}
+	if (gd) {
+		mutex_unlock(&gd->mr_lock);
+		atomic_dec(&gd->refcount);
+	}
+	gdr_mr_put(gmr); /* for callback */
 }
+#endif /* NVIDIA_GPU_DIRECT */
 
 /**
- * do_munmap_and_unpin_gpu_buf() - unpin and unmap a gpu buffer.
- * @mr: A pointer to a struct gdr_mr for the gpu buffer to be pinned/mmapped
- *
- * This is called when the user has requested a GPU buffer to be unpinned,
- * or also at various places in this driver to unwind from an error situation,
- * or to "evict" an entry from the cache.
- *
- * This function can race with gdrdrv_get_pages_free_callback(). See comments
- * below for details on how that race is resolved.
- *
- * The caller of this function must hold an "ioctl" reference on this mr.
- * This function releases that "ioctl" reference.  It may also under
- * some cirumstances release the "callback" reference.
- *
- * This mr structure MAY be freed during the releasing of these references.
- */
-static void
-do_munmap_and_unpin_gpu_buf(struct gdr_mr *mr)
-{
-	struct rv_gdrdata *gd = mr->gd;
-	unsigned int npages;
-	int ret;
-
-	mutex_lock(&gd->mr_lock);
-	gdrdrv_munmap(mr);
-	mutex_unlock(&gd->mr_lock);
-	/*
-	 * This function call can race with gdrdrv_get_pages_free_callback().
-	 * The Nvidia driver's nvidia_p2p_put_pages() function serializes these
-	 * events. nvidia_p2p_put_pages() has three expected return values:
-	 *
-	 *	0 - nvidia_p2p_put_pages() is successful, indicating
-	 *	    that nvidia_p2p_put_pages() has unpinned this GPU buffer,
-	 *	    and the gdrdrv_get_pages_free_callback() has been
-	 *	    unregistered for that GPU buffer.
-	 *
-	 *	-EINVAL - nvidia_p2p_put_pages() lost the race with
-	 *		  gdrdrv_get_pages_free_callback().  The callback
-	 *		  handler unmapped and unpinned the GPU buffer.
-	 *
-	 *	-EIO - This is an "unknown" error.
-	 *
-	 * If gdrdrv_get_pages_free_callback() executes first, then it will
-	 * unpin this buffer (it was already unmmapped above), and
-	 * it will release the "callback mr reference".  In this case
-	 * the nvidia_p2p_put_pages() will return -EINVAL, so in this
-	 * case we need only release the "ioctl mr reference".
-	 *
-	 * If nvidia_p2p_put_pages() executes first, then it will unpin
-	 * this GPU buffer and also unregister the free callback handler.
-	 * So the free callback handler will never be called for this
-	 * gdr_mr. In this case, nvidia_p2p_put_pages() returns 0 value
-	 * "sucess". This means this code path needs to also release the
-	 * "callback mr reference".
-	 *
-	 * In the case where nvidia_p2p_put_pages() succeeds, the "free
-	 * callback handler" does NOT get called for this GPU buffer.
-	 * nvidia_p2p_put_pages() deregisters the "free callback" handler
-	 * from this GPU buffer.
-	 */
-	ret = nvidia_p2p_put_pages(0, 0, mr->mrc.addr, mr->page_table);
-	mutex_lock(&gd->mr_lock);
-	npages = num_user_pages_gpu(mr->mrc.addr, mr->mrc.len);
-	gd->n_pages_locked -= npages;
-	release_ioctl_mr_ref(mr);
-	if (!ret) {
-		mr->page_table = NULL;
-		release_callback_mr_ref(mr);
-	}
-
-	mutex_unlock(&gd->mr_lock);
-}
-
-/**
- * create_mr() - create a new memory region
+ * create_gmr() - create a new GPU memory region
  * @gd: A pointer to the rv_gdrdata for this open file descriptor.
  * @gpu_buf_addr: GPU buffer start address
  * @gpu_buf_size: GPU buffer size
  *
  * kref_init() intializes the reference count on this gdr_mr
- * to 1.  This is treated as the "ioctl_mr_ref()" for this
+ * to 1.  This is treated as the "cache mr_ref()" for this
  * gdr_mr.
  *
  * Return:
- * Pointer to the new mr if successful. NULL otherwise.
+ * Pointer to the new gmr if successful. NULL otherwise.
  */
-static struct gdr_mr *create_mr(struct rv_gdrdata *gd,
-				u64 gpu_buf_addr,
-				u32 gpu_buf_size)
+static struct gdr_mr *create_gmr(struct rv_gdrdata *gd,
+				 u64 gpu_buf_addr, u64 gpu_buf_size,
+#ifdef NVIDIA_GPU_DIRECT
+				 u32 access)
+#else
+				 u32 access, u32 ipc_handle, u64 alloc_id,
+				 u64 base_addr)
+#endif
 {
-	struct gdr_mr *mr;
+	struct gdr_mr *gmr;
 
-	mr = kzalloc(sizeof(*mr), GFP_KERNEL);
-	if (!mr)
-		return mr;
+	gmr = kzalloc(sizeof(*gmr), GFP_KERNEL);
+	if (!gmr)
+		return gmr;
 
-	mr->mrc.addr = gpu_buf_addr;
-	mr->mrc.len = gpu_buf_size;
-	mr->gd = gd;
-	mr->mr_handle = get_random_handle();
-	mr->host_addr = 0;
-	mr->page_table = NULL;
-	kref_init(&mr->ref_cnt);
+	rv_mr_cache_entry_init(&gmr->mrc.entry, gpu_buf_addr, gpu_buf_size,
+			       access);
+#ifdef INTEL_GPU_DIRECT
+	gmr->ipc_handle = ipc_handle;
+	gmr->alloc_id = alloc_id;
+	gmr->base_addr = base_addr;
+#endif
+	spin_lock_init(&gmr->lock);
+	atomic_inc(&gd->refcount);
+	gmr->gd = gd;
+	gmr->rv_inx = gd->rv_inx;
+	gmr->mr_handle = get_random_handle();
+	gmr->host_addr = 0;
+#ifdef NVIDIA_GPU_DIRECT
+	gmr->page_table = NULL;
+	gmr->dma_mapping = NULL;
+#endif
+	kref_init(&gmr->ref_cnt);
+#ifdef INTEL_GPU_DIRECT
+	trace_rv_gdr_mr_create(gmr->rv_inx, gpu_buf_addr, gpu_buf_size,
+			       alloc_id, base_addr, access, ipc_handle);
+#else
+	trace_rv_gdr_mr_create(gmr->rv_inx, gpu_buf_addr, gpu_buf_size, access);
+#endif
+	trace_rv_gdr_msg_create_gmr(gmr->rv_inx, "gmr, gd->refcount", (u64)gmr,
+				    atomic_read(&gd->refcount));
 
-	return mr;
+	return gmr;
 }
 
 /**
- * evict_gpu_cache() - Evict certain number of pages from a cache
- * @gd: A pointer to the rv_gdrdata for this open file descriptor.
- * @target: Target number of pages to be evicted from the cache.
+ * pin a gpu buffer
  *
- * The caller must acquire gd->mr_lock mutex before calling.
+ * allocate and pin a gdr_mr for GPU memory.
  *
  * Return:
- * Number of pages evicted from the cache.
+ * gdr_mr ptr - success, have mrc->entry.refcount and gmr->entry.ref_cnt
+ * other - unable to pin the gpu buffer
+ *	-ENOMEM for BAR or other resource exhaustions
+ * called with gd->mr_lock
  */
-static u32 evict_gpu_cache(struct rv_gdrdata *gd, u32 target)
+static struct gdr_mr *
+do_pin_gpu_buf(struct rv_gdrdata *gd,
+	       u64 gpu_buf_addr, u64 gpu_buf_size, u32 access,
+#ifdef NVIDIA_GPU_DIRECT
+	       bool is_mmap)
+#else
+	       u32 ipc_handle, u64 alloc_id, u64 base_addr, bool is_mmap)
+#endif
 {
-	struct gdr_mr *mr, *ptr;
-	unsigned int npages, cleared = 0;
-
-	list_for_each_entry_safe_reverse(mr, ptr, &gd->lru_list, list) {
-		npages = num_user_pages_gpu(mr->mrc.addr, mr->mrc.len);
-		/* this node will be evicted, add its pages to our count */
-		cleared += npages;
-		acquire_ioctl_mr_ref(mr);
-		mutex_unlock(&gd->mr_lock);
-		do_munmap_and_unpin_gpu_buf(mr);
-		mutex_lock(&gd->mr_lock);
-		/* have enough pages been cleared? */
-		if (cleared >= target)
-			break;
-	}
-	return cleared;
-}
-
-/**
- * do_pin_and_mmap_gpu_buf() - pin and mmap a gpu buffer
- * @fp: A pointer to an open file structure for this file.
- * @gd: A pointer to the rv_gdrdata for this open file.
- * @mr: A pointer to struct gdr_mr which contains the starting address and
- *      the size of the gpu buffer.
- *
- * The caller has searched the red/black tree of gdr_mr structures and
- * didn't find one that matches the GPU desired buffer.  This routine pins and
- * mmaps the GPU buffer and adds it to the tree of gdr_mr structures.
- *
- * Side Effects:
- *	This function uses gd->map_this_mr to indirectly pass a pointer to a
- *	gdr_mr struct to this driver's mmap handler, rv_gdr_mmap(), outside
- *	the normal call stack mechanism.
- *
- *	gd->map_this_mr is set prior to calling vm_mmap().  vm_mmap() will
- *	call rv_gdr_mmap() to do this driver-specific memory map operation.
- *	The gd->map_this_mr pointer allows rv_gdr_mmap() to quickly find
- *	this descriptor for the physical addresses that are to be mmapped.
- *
- *	When vm_mmap() returns, the gd->map_this_mr is cleared as clean up
- *	after the mmap operation has completed.
- *
- * Return:
- * 0 - success,
- * other - unable to pin or mmap the gpu buffer
- */
-static int
-do_pin_and_mmap_gpu_buf(struct file *fp,
-			struct rv_gdrdata *gd,
-			struct gdr_mr *mr)
-{
-	unsigned long virtual, max_cache_pages;
-	unsigned int npages, target, cleared;
+	struct gdr_mr *gmr;
 	int ret = 0;
 
+#ifdef NVIDIA_GPU_DIRECT
+	gmr = create_gmr(gd, gpu_buf_addr, gpu_buf_size, access);
+#else
+	gmr = create_gmr(gd, gpu_buf_addr, gpu_buf_size, access, ipc_handle,
+			 alloc_id, base_addr);
+#endif
+	if (!gmr)
+		return ERR_PTR(-ENOMEM);
+#ifdef INTEL_GPU_DIRECT
+	trace_rv_gdr_mr_do_pin(gmr->rv_inx, gpu_buf_addr, gpu_buf_size,
+			       alloc_id, base_addr, access, ipc_handle);
+#else
+	trace_rv_gdr_mr_do_pin(gmr->rv_inx, gpu_buf_addr, gpu_buf_size, access);
+#endif
+
+	if (is_mmap)
+		ret = pin_gpu_buf_mmap(gmr);
+	else
+		ret = pin_gpu_buf_mr(gmr);
+	if (ret) {
+		trace_rv_gdr_msg_do_pin(gd->rv_inx,
+					"failed to pin gpu pages: size, ret",
+					gpu_buf_size, (u64)ret);
+		rv_mr_cache_entry_deinit(&gmr->mrc.entry);
+		gdr_mr_put_gd(gmr);
+		gdr_mr_put(gmr);
+		return ERR_PTR(ret);
+	} else {
+		return gmr;
+	}
+}
+
+/*
+ * caller holds gdrdata.mr_lock and has a reference for gdr_mr and a
+ * gdr_mr.mrc.entry.refcount
+ * ioctl_busy_lock protects against races with mmap calls for other ioctls.
+ * For Nvidia GPU, gdr_mr.mrc.entry.refcount will hold off free_callback until
+ * we and our caller are done, so it won't free gdr_mr.page_table until we are
+ * done (and we release our gdr_mr.mrc.entry.refcount).
+ */
+static int
+do_mmap_gpu_buf(struct file *fp, struct gdr_mr *gmr)
+{
+	struct rv_gdrdata *gd = gmr->gd;
+	unsigned long virtual;
+	int ret;
+
+	WARN_ON(gd->map_this_mr);
+	gd->map_this_mr = gmr;
+
+	mutex_unlock(&gd->mr_lock);
+
+	virtual = vm_mmap(fp, 0, gmr->mrc.entry.len, PROT_READ | PROT_WRITE,
+			  MAP_SHARED, handle_to_offset(gmr->mr_handle));
+
 	mutex_lock(&gd->mr_lock);
 
-	max_cache_pages = ((gpu_cache_size << 20) >> NV_GPU_PAGE_SHIFT);
-	npages = num_user_pages_gpu(mr->mrc.addr, mr->mrc.len);
+	gd->map_this_mr = NULL;
+#ifdef NVIDIA_GPU_DIRECT
+	WARN_ON(!gmr->page_table);
+#endif
 
-	if (gd->n_pages_locked + npages > max_cache_pages) {
-		if (npages > max_cache_pages) {
-			mutex_unlock(&gd->mr_lock);
-			return -EINVAL;
-		}
-		target = npages - (max_cache_pages - gd->n_pages_locked);
-		cleared = evict_gpu_cache(gd, target);
-		WARN_ON(cleared < target);
-	}
-
-	ret = get_gpu_pages(mr->mrc.addr, mr->mrc.len,
-			    &mr->page_table,
-			    gdrdrv_get_pages_free_callback,
-			    mr);
-
-	if (ret) {
-		/*
-		 * As per NVIDIA's documentation, nvidia_p2p_get_pages API
-		 * returns -EINVAL if an invalid argument was supplied.
-		 * While testing the code, it was found that the API may
-		 * return -EINVAL and not -ENOMEM if there isn't enough GPU
-		 * BAR memory to pin the required number of pages. So if the
-		 * error return is -ENOMEM or -EINVAL, we make an attempt to
-		 * evict npages from the pinned buffer cache and try
-		 * pinning the buffer again.
-		 */
-		if ((ret == -ENOMEM) || (ret == -EINVAL)) {
-			target = npages;
-			cleared = evict_gpu_cache(gd, target);
-			ret = get_gpu_pages(mr->mrc.addr,
-					    mr->mrc.len,
-					    &mr->page_table,
-					    gdrdrv_get_pages_free_callback,
-					    mr);
-			if (!ret)
-				goto pin_success;
-		}
-		mutex_unlock(&gd->mr_lock);
-		kfree(mr);
+	if (IS_ERR((void *)virtual)) {
+		ret = PTR_ERR((void *)virtual);
+		rv_err(gmr->rv_inx, "mmap failed %d\n", ret);
+		gd->stats.failed_mmap++;
 		return ret;
 	}
-pin_success:
-	gd->n_pages_locked += npages;
 
-	acquire_callback_mr_ref(mr);
-
-	/*
-	 * Save this mr so that this driver's mmap handler rv_gdr_mmap()
-	 * can find it quickly and process it.  On success, the pinned
-	 * GPU memory described by this mr will be mmapped into the user's
-	 * address space.
-	 */
-	gd->map_this_mr = mr;
-
-	mutex_unlock(&gd->mr_lock);
-
-	/*
-	 * mmap the set of physical pages that in the mr->page_table
-	 * list of physical page addresses.  mr->page_table was
-	 * constructed by the get_gpu_pages() call above.
-	 */
-	virtual = vm_mmap(fp, 0, mr->mrc.len,
-			  PROT_READ|PROT_WRITE,
-			  MAP_SHARED,
-			  handle_to_offset(mr->mr_handle));
-
-	mutex_lock(&gd->mr_lock);
-
-	/*
-	 * The mmap operation on this pinned GPU buffer has completed,
-	 * so clean up.  This cleanup is important, as rv_gdr_mmap()
-	 * tests for a NULL gd->map_this_mr to identify cases where the
-	 * application has called the mmap(2) system call.
-	 */
-	gd->map_this_mr = NULL;
-
-	if (!mr->page_table) {
-		/*
-		 * In this case, the free callback handler has unpinned
-		 * this gdr_mr structure.  But it's POSSIBLE that the
-		 * mapping of that pinned buffer succeeded.
-		 *
-		 * But the virtual address of that mapping isn't available
-		 * until the vm_mmap() call has returned here.  So the
-		 * callback handler can not have done the proper unmap.
-		 * So we need to do the munmap here, even though the
-		 * GPU buffer has already been unpinned.
-		 */
-		if (!IS_ERR((void *)virtual)) {
-			int munmap_ret;
-
-			munmap_ret = vm_munmap(mr->host_addr, mr->mrc.len);
-			WARN_ON(munmap_ret);
-		}
-		release_ioctl_mr_ref(mr);
-		mutex_unlock(&gd->mr_lock);
-		return -EINVAL;
-	}
-
-	/*
-	 * This is a case where the GPU buffer is still pinned,
-	 * but this driver's mmap handler failed for some other
-	 * reason.
-	 *
-	 * So the mr->host_addr is not set in this error case,
-	 * but we still want to unpin this GPU buffer.
-	 */
-	if (IS_ERR((void *)virtual)) {
-		WARN_ON(1);
-		mutex_unlock(&gd->mr_lock);
-		do_munmap_and_unpin_gpu_buf(mr);
-		return virtual;
-	}
-
-	mr->host_addr = virtual;
-	ret = rv_mr_cache_insert(gd->gdr_cache, &mr->mrc);
-	if (ret)
-		WARN_ON(ret);
-	list_add(&mr->list, &gd->lru_list);
-	mutex_unlock(&gd->mr_lock);
-
-	return ret;
+	WARN_ON(gmr->host_addr);
+	gmr->host_addr = virtual;
+	trace_rv_gdr_msg_do_mmap(gmr->rv_inx, "gmr, host_addr", (u64)gmr,
+				 gmr->host_addr);
+	return 0;
 }
 
 /**
- * fetch_user_query_ioctl_params - fetch and validate arguments.
- * @arg
- * @query_params
+ * fetch_user_mparams - fetch and validate user ioctl arguments.
+ * @arg - a pointer to user ioctl arguments
+ * @mparams - a pointer to rv_gpu_mem_params
  *
- * Fetch from user space the query parameter block and validate its content.
+ * Fetch from user space the ioctl parameter block and validate its content.
  *
  * Return:
  * 0 on success
  * -EFAULT on bad parameter block address
  * -EINVAL on invalid content of parameter block
  */
-int
-fetch_user_query_ioctl_params(unsigned long arg,
-			      struct rv_gpu_mem_params *query_params)
+int fetch_user_mparams(unsigned long arg, u32 rev, struct rv_gpu_mem_params *mparams)
 {
-	if (copy_from_user(query_params,
-			   (struct rv_gpu_mem_params __user *)arg,
-			   sizeof(*query_params)))
-		return -EFAULT;
-	/* XXX We should version this! - just not doing it right now */
-	#if 0
-	if (query_params->in.version != RV_GDR_VERSION)
-		return -ENODEV;
-	#endif
-	if ((!query_params->in.gpu_buf_size) ||
-	    (query_params->in.gpu_buf_addr & ~NV_GPU_PAGE_MASK) ||
-	    (query_params->in.gpu_buf_size & ~NV_GPU_PAGE_MASK))
+	if (rev <= RV_GPU_ABI_VERSION(1, 0)) {
+		/* smaller structure w/o alloc_id */
+		if (copy_from_user(&mparams->in,
+				   (struct rv_gpu_mem_params __user *)arg,
+				   sizeof(struct rv_gpu_mem_params_r0_in)))
+			return -EFAULT;
+	} else {
+		if (copy_from_user(&mparams->in,
+				   (struct rv_gpu_mem_params __user *)arg,
+				   sizeof(mparams->in)))
+			return -EFAULT;
+	}
+	if ((!mparams->in.gpu_buf_size) ||
+	    !(mparams->in.access & IBV_ACCESS_IS_GPU_ADDR) ||
+#ifdef NVIDIA_GPU_DIRECT
+	    (mparams->in.gpu_buf_addr & ~GPU_PAGE_MASK) ||
+	    (mparams->in.gpu_buf_size & ~GPU_PAGE_MASK))
+#else
+	    (rev <= RV_GPU_ABI_VERSION(1, 0)) || /* lacks alloc_id */
+	    !(mparams->in.ipc_handle))
+#endif
 		return -EINVAL;
 
 	return 0;
 }
 
 /**
- * ioctl_gpu_buf_pin_mmap() - process the RV_IOCTL_GDR_GPU_PIN_MMAP
+ * rv_ioctl_gpu_buf_pin_mmap() - process the RV_IOCTL_GDR_GPU_PIN_MMAP
  * @fp: A pointer to the open file structure for this file.
  * @gd: A pointer to the rv_gdrdata structure for this file.
  * @arg: A pointer to the struct rv_gpu_mem_params argument.
  *
- * This function handles ioctl() requests to return a host address
- * for a pinned and mmapped gpu buffer.
+ * This function handles ioctl() requests to pin and mmap a gpu buffer.
+ * mmap buffers are short lived, so we immediately put our mrce->refcount
+ * and expect PSM/app to not free them while gdrcopy is in progress.
  *
- * Search the red/black tree for the desired gpu buffer among the tree
- * of struct gdr_mr structures.  If it isn't found, then pin and mmap it,
- * and add it to the red/black tree
+ * Check the cache for the desired gpu buffer
+ * If it isn't found, then pin and mmap it, and insert in cache.
+ *
+ * Must release gdrdata.mr_lock during vm_mmap, so ioctl_busy lock prevents
+ * races with other ioctl calls.
+ *
+ * A free_callback can race and set freeing flag for our gdr_mr in which
+ * case for a new gdr_mr, insert will fail and we cleanup our gdr_mr and then
+ * free_callback can proceed.  For a cache hit, our put of mrce->refcount
+ * can allow free_callback to cleanup the gdr_mr immediately after we are done.
  *
  * On success, return to the user the user host address of this mapping.
- * This "fast path" in this code is when the gpu buffer is already found
- * in the red/black tree.  We want this case to run with minimal overhead.
+ * The "fast path" in this code is when the gpu buffer is already found
+ * in the cache.  We want this case to run with minimal overhead.
+ *
+ * We require access to specify at least IBV_ACCESS_IS_GPU_ADDR, this way
+ * RV_IOCTL_EVICT can use that flag in access to identify requests for
+ * exact match GPU pin (or verbs MR) evictions (essentially an unpin call)
  *
  * Return:
  * 0 - success,
@@ -769,194 +1087,246 @@ fetch_user_query_ioctl_params(unsigned long arg,
  * -EINVAL - The operation requested was not valid,
  * -ENOENT - An unpin was requested, but the desired gpu buffer was not found,
  */
-static int
-ioctl_gpu_buf_pin_mmap(struct file *fp,
-		       struct rv_gdrdata *gd,
-		       unsigned long arg)
+int rv_ioctl_gpu_buf_pin_mmap(struct file *fp, struct rv_gdrdata *gd, unsigned long arg, u32 rev)
 {
-	struct rv_gpu_mem_params query_params;
-	struct gdr_mr *mr = NULL;
+	struct rv_gpu_mem_params mparams;
+	struct gdr_mr *gmr = NULL;
 	int ret = 0;
-	struct rv_mr_cached *mrc;
+	struct rv_mr_cache_entry *mrce;
+	u64 addr_in, offset;
 
-	ret = fetch_user_query_ioctl_params(arg, &query_params);
+	if (!rv_gdr_enabled(gd))
+		return -EINVAL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
+	if (atomic_cmpxchg(&gd->ioctl_busy_flag, 0, 1))
+		return -EINVAL;
+	ret = fetch_user_mparams(arg, rev, &mparams);
 	if (ret)
-		return ret;
+		goto done;
+
+#ifdef NVIDIA_GPU_DIRECT
+	trace_rv_gdr_mr_pin_mmap(gd->rv_inx, mparams.in.gpu_buf_addr,
+				 mparams.in.gpu_buf_size, mparams.in.access);
+#else
+	trace_rv_gdr_mr_pin_mmap(gd->rv_inx, mparams.in.gpu_buf_addr,
+				 mparams.in.gpu_buf_size, mparams.in.alloc_id,
+				 mparams.in.gpu_buf_addr, mparams.in.access,
+				 mparams.in.ipc_handle);
+#endif
+	/*
+	 * Round down the address and round up the size.
+	 * For Nvidia GPU, this is not required because we have checked to make sure
+	 * they are page aligned.
+	 */
+	addr_in = mparams.in.gpu_buf_addr;
+	offset = addr_in & (GPU_PAGE_SIZE - 1);
+	mparams.in.gpu_buf_addr = addr_in & GPU_PAGE_MASK;
+	mparams.in.gpu_buf_size = ALIGN(mparams.in.gpu_buf_size + offset, GPU_PAGE_SIZE);
 
 	mutex_lock(&gd->mr_lock);
-	mrc = rv_mr_cache_search(gd->gdr_cache,
-				 query_params.in.gpu_buf_addr,
-				 query_params.in.gpu_buf_size,
-				 0, true, false); /* XXX fix access here */
-	if (mrc) {
-		/*
-		 * A buffer found in the cache that partially or completely
-		 * overlaps the address range.
-		 */
-		mr = container_of(mrc, struct gdr_mr, mrc);
-		if (mrc->len >= query_params.in.gpu_buf_size) {
-			/*
-			 * Buffer found in the cache that has the same
-			 * starting address and is the same length as or is
-			 * longer than the requested buffer.
-			 *
-			 * This code path never releases mr_lock after
-			 * the gdr_mr struct has been found in the r/b tree,
-			 * until after it is completely finished with that
-			 * gdr_mr struct.
-			 *
-			 * So while LOGICALLY we could acquire and release
-			 * an ioctl reference in this code path, there is no
-			 * need to actually do that.
-			 */
-			query_params.out.host_buf_addr = mr->host_addr;
-			/*
-			 * Since this mr is being "used", move this mr to
-			 * the end of the list.
-			 */
-			list_del(&mr->list);
-			list_add(&mr->list, &gd->lru_list);
-			mutex_unlock(&gd->mr_lock);
-			goto skip_pin_mmap;
-		} else {
-			/*
-			 * mrc->len < gpu_buf_size
-			 *
-			 * A buffer found in the cache that has the same
-			 * starting address but is of lesser length.
-			 * Need to unmap and unpin the old old smaller
-			 * GPU buffer, freeing the struct gdr_mr in the
-			 * processs.
-			 *
-			 * A new struct gdr_mr will be allocated, and a
-			 * new, larger GPU buffer will be pinned and
-			 * mmapped below.
-			 */
-			acquire_ioctl_mr_ref(mr);
-			mutex_unlock(&gd->mr_lock);
-			do_munmap_and_unpin_gpu_buf(mr);
-			mutex_lock(&gd->mr_lock);
+#ifdef INTEL_GPU_DIRECT
+search_again:
+#endif
+	/* callers gpu buffer will be page aligned and multiple of pages */
+	mrce = rv_mr_cache_search_get(&gd->cache,
+				      mparams.in.gpu_buf_addr,
+				      mparams.in.gpu_buf_size,
+				      mparams.in.access,
+#ifdef INTEL_GPU_DIRECT
+				      false, true);
+#else
+				      true, true);
+#endif
+	if (IS_ERR(mrce)) {
+		ret = PTR_ERR(mrce);
+		goto unlock;
+	}
+	if (mrce) {
+		gmr = container_of(mrce, struct gdr_mr, mrc.entry);
+#ifdef INTEL_GPU_DIRECT
+		if (gmr->alloc_id != mparams.in.alloc_id) {
+			/* we still have gd->mr_lock so mrce won't go away */
+			rv_mr_cache_entry_put(&gd->cache, mrce);
+			gdr_invalidate(gd, gmr);
+			goto search_again;
 		}
+		rv_mr_cache_inc_hit(&gd->cache);	// was a real hit
+#endif
+		/* If the mrce is a superset, we need to calculate the offset */
+		offset = addr_in - mrce->addr;
+		if (!gmr->host_addr) {
+			/* This will release and reaqcuire mr_lock */
+			ret = do_mmap_gpu_buf(fp, gmr);
+			if (ret)
+				goto done_put;
+			WARN_ON(!gmr->mrc.mr.ib_mr);
+			gd->stats.hit_add_mmap++;
+			rv_mr_cache_entry_promote(&gd->cache, mrce);
+		} else {
+			gd->stats.hit_mmap++;
+		}
+		goto skip_pin_mmap;
 	}
-	mr = create_mr(gd,
-		       query_params.in.gpu_buf_addr,
-		       query_params.in.gpu_buf_size);
-	mutex_unlock(&gd->mr_lock);
-	ret = do_pin_and_mmap_gpu_buf(fp, gd, mr);
-	if (!ret) {
-		mutex_lock(&gd->mr_lock);
-		query_params.out.host_buf_addr = mr->host_addr;
-		release_ioctl_mr_ref(mr);
-		mutex_unlock(&gd->mr_lock);
+	gmr = do_pin_gpu_buf(gd, mparams.in.gpu_buf_addr,
+			     mparams.in.gpu_buf_size,
+			     mparams.in.access,
+#ifdef NVIDIA_GPU_DIRECT
+			     true);
+#else
+			     mparams.in.ipc_handle,
+			     mparams.in.alloc_id,
+			     mparams.in.gpu_buf_addr, true);
+			     /*
+			      * mmap (gdrcopy) always passes a base address
+			      * in 'gpu_buf_addr', and 'base_addr' is not set.
+			      */
+#endif
+	if (IS_ERR(gmr)) {
+		/* if unable to pin (out of BAR) let PSM evict and retry */
+		ret = PTR_ERR(gmr);
+		goto unlock;
 	}
 
+	/* This will release and reaqcuire mr_lock */
+	ret = do_mmap_gpu_buf(fp, gmr);
+	if (ret)
+		goto bail_unpin;
+	gmr->mrc.entry.type = RV_MRCE_TYPE_MMAP;
+	/* If evict, this may release and reaqcuire mr_lock while put_pages */
+	ret = rv_mr_cache_insert(&gd->cache, &gmr->mrc.entry);
+	if (ret) {
+		rv_err(gd->rv_inx, "failed to insert gdr cache %d\n", ret);
+		goto bail_unmmap;
+	}
 skip_pin_mmap:
-	if ((!ret) && (copy_to_user((struct hfi_gdr_query_params __user *)arg,
-				    &query_params,
-				    sizeof(query_params))))
-		return -EFAULT;
-
+	mparams.out.host_buf_addr = gmr->host_addr + offset;
+#ifdef NVIDIA_GPU_DIRECT
+	mparams.out.phys_addr = gmr->page_table->pages[0]->physical_address + offset;
+#else
+	mparams.out.phys_addr = 0;
+#endif
+	if (copy_to_user((void __user *)arg, &mparams.out,
+			 sizeof(mparams.out)))
+		ret = -EFAULT;
+done_put:
+#ifdef NVIDIA_GPU_DIRECT
+	trace_rv_gdr_mr_pin_mmap(gmr->rv_inx, gmr->mrc.entry.addr,
+				 gmr->mrc.entry.len, gmr->mrc.entry.access);
+#else
+	trace_rv_gdr_mr_pin_mmap(gmr->rv_inx, gmr->mrc.entry.addr,
+				 gmr->mrc.entry.len, gmr->alloc_id,
+				 gmr->base_addr, gmr->mrc.entry.access,
+				 gmr->ipc_handle);
+#endif
+	rv_mr_cache_put(&gd->cache, &gmr->mrc.entry, true);
+unlock:
+	mutex_unlock(&gd->mr_lock);
+done:
+	WARN_ON(atomic_read(&gd->ioctl_busy_flag) != 1);
+	atomic_set(&gd->ioctl_busy_flag, 0);
 	return ret;
+
+bail_unmmap:
+bail_unpin:
+	rv_err(gd->rv_inx, "fail pin: gmr %p\n", gmr);
+	/* not in cache yet so can't call rv_mr_cache_put */
+	rv_mr_cache_entry_deinit(&gmr->mrc.entry);
+	/* remove checks more than needed, but ok */
+	gdr_cache_mrce_remove(&gd->cache, gd, &gmr->mrc.entry, 0);
+	goto unlock;
 }
 
-/**
- * ioctl_gpu_buf_unmap_unpin() - process the RV_IOCTL_GDR_GPU_UNPIN_MUNMAP
- * @fp: A pointer to the open file structure for this file.
+/*
+ * rv_ioctl_gpu_evict() - GPU specific part of RV_IOCTL_EVICT
  * @gd: A pointer to the rv_gdrdata structure for this file.
- * @arg: A pointer to the struct rv_gpu_mem_params argument.
+ * @params: params from the ioctl, caller will copy_to_user
  *
  * This function handles the ioctl() request to unpin and unmap a gpu buffer.
  *
  * Return:
  * 0 - success,
- * -EFAULT - The copy_from_user() or copy_to_user() function failed,
- * -EINVAL - The gpu buffer described is not properly aligned,
  * -EINVAL - The operation requested was not valid,
- * -ENOENT - An unpin was requested, but the desired gpu buffer was not found,
+ * -ENOENT - No entry was evicted from cache
  */
-static int
-ioctl_gpu_buf_munmap_unpin(struct file *fp,
-			   struct rv_gdrdata *gd,
-			   unsigned long arg)
+int rv_ioctl_gpu_evict(struct rv_gdrdata *gd, struct rv_evict_params *params)
 {
-	struct rv_gpu_mem_params query_params;
-	struct gdr_mr *mr = NULL;
 	int ret = 0;
-	struct rv_mr_cached *mrc;
+	struct evict_out out;
 
-	ret = fetch_user_query_ioctl_params(arg, &query_params);
-	if (ret)
-		return ret;
-
-	mutex_lock(&gd->mr_lock);
-	mrc = rv_mr_cache_search(gd->gdr_cache,
-				 query_params.in.gpu_buf_addr,
-				 query_params.in.gpu_buf_size,
-				 0, false, true); /* XXX fix access here! */
-	if (mrc) {
-		mr = container_of(mrc, struct gdr_mr, mrc);
-		acquire_ioctl_mr_ref(mr);
-	}
-	mutex_unlock(&gd->mr_lock);
-
-	if (mr)
-		do_munmap_and_unpin_gpu_buf(mr);
-	else
-		ret = -ENOENT;
-
-	return ret;
-}
-
-/**
- * rv_gdr_ioctl() - This is this driver's ioctl() handler
- * @fp: A pointer to the open file structure for this file.
- * @cmd: The ioctl() command to execute.
- * @arg: The argument to this ioctl() request.
- *
- * Only one thread at a time is allowed to execute this ioctl() handler.
- * If there is a thread executing in this handler, and a second thread
- * calls this ioctl(), the second thread will get a -EINVAL failure.
- *
- * There are two recognized commands to this ioctl.
- *
- *	RV_IOCTL_GDR_GPU_PIN_MMAP, a request to either retrieve the
- *	host address for a pinned/mmapped gpu buffer, or a request
- *	to unpin and unmap a previously pinned gpu buffer.
- *
- *	RV_IOCTL_GDR_GPU_MUNMAP_UNPIN, a request to munmap and unpin
- *	a gpu buffer.
- *
- * Return:
- * 0 - success,
- * -EINVAL - There is already a thread executing in this ioctl handler,
- * -EINVAL - the cmd argument is not a known value.
- */
-static long rv_gdr_ioctl(struct file *fp, unsigned int cmd,
-			   unsigned long arg)
-{
-	struct rv_gdrdata *gd = fp->private_data;
-	int ret = 0;
-
+	if (!rv_gdr_enabled(gd))
+		return -EINVAL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
 	if (atomic_cmpxchg(&gd->ioctl_busy_flag, 0, 1))
 		return -EINVAL;
 
-	switch (cmd) {
-	case RV_IOCTL_GPU_PIN_MMAP:
-		ret = ioctl_gpu_buf_pin_mmap(fp, gd, arg);
-		break;
-	case RV_IOCTL_GPU_MUNMAP_UNPIN:
-		ret = ioctl_gpu_buf_munmap_unpin(fp, gd, arg);
-		break;
-	default:
-		ret =  -EINVAL;
+	mutex_lock(&gd->mr_lock);
+	if (params->in.type == RV_EVICT_TYPE_SEARCH_EXACT) {
+		trace_rv_mr_cache_gpu_evict(params->in.search.addr,
+					    params->in.search.length,
+					    params->in.search.access);
+		ret = rv_mr_cache_evict_exact(&gd->cache,
+					      params->in.search.addr,
+					      params->in.search.length,
+					      params->in.search.access);
+		if (ret) {
+			trace_rv_mrc_msg_gpu_evict("Evict exact failed: ret",
+						   (u64)ret, 0, 0);
+			goto bail_unlock;
+		}
+		params->out.bytes = params->in.search.length;
+		params->out.count = 1;
+		trace_rv_mrc_msg_gpu_evict("Evict exact: bytes, count",
+					   params->out.bytes,
+					   params->out.count, 0);
+	} else if (params->in.type == RV_EVICT_TYPE_GPU_SEARCH_RANGE) {
+		trace_rv_mr_cache_gpu_evict(params->in.search.addr,
+					    params->in.search.length,
+					    0);
+		ret = rv_mr_cache_evict_range(&gd->cache,
+					      params->in.search.addr,
+					      params->in.search.length,
+					      &out);
+		if (ret) {
+			trace_rv_mrc_msg_gpu_evict("Evict range failed: ret",
+						   (u64)ret, 0, 0);
+			goto bail_unlock;
+		}
+		params->out.bytes = out.bytes;
+		params->out.count = out.count;
+		trace_rv_mrc_msg_gpu_evict("Evict range: bytes, count",
+					   params->out.bytes,
+					   params->out.count, 0);
+	} else if (params->in.type == RV_EVICT_TYPE_GPU_AMOUNT) {
+		trace_rv_mrc_msg_gpu_evict("Evict amount: bytes, count",
+					   params->in.amount.bytes,
+					   params->in.amount.count, 0);
+		ret = rv_mr_cache_evict_amount(&gd->cache,
+					       params->in.amount.bytes,
+					       params->in.amount.count,
+					       &out);
+		if (ret) {
+			trace_rv_mrc_msg_gpu_evict("Evict amount failed: ret",
+						   (u64)ret, 0, 0);
+			goto bail_unlock;
+		}
+		params->out.bytes = out.bytes;
+		params->out.count = out.count;
+		trace_rv_mrc_msg_gpu_evict("Evict amount: bytes, count",
+					   params->out.bytes,
+					   params->out.count, 0);
+	} else {
+		ret = -EINVAL;
 	}
-
+bail_unlock:
+	mutex_unlock(&gd->mr_lock);
 	WARN_ON(atomic_read(&gd->ioctl_busy_flag) != 1);
 	atomic_set(&gd->ioctl_busy_flag, 0);
-
 	return ret;
 }
 
+#ifdef NVIDIA_GPU_DIRECT
 /**
  * gdr_mmap_phys_mem_wcomb()
  * @vma: A pointer to a vm_area_struct for physical memory segment to be mmaped.
@@ -977,18 +1347,89 @@ static int gdr_mmap_phys_mem_wcomb(struct vm_area_struct *vma,
 				   size_t size)
 {
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
-
-	if (io_remap_pfn_range(vma, vaddr,
-			       PHYS_PFN(paddr),
-			       size,
+	if (io_remap_pfn_range(vma, vaddr, PHYS_PFN(paddr), size,
 			       vma->vm_page_prot))
 		return -EAGAIN;
-
 	return 0;
 }
 
+static int gdr_mmap(struct gdr_mr *gmr, struct vm_area_struct *vma)
+{
+	int ret = 0;
+	size_t size = vma->vm_end - vma->vm_start;
+	int p = 0;
+	unsigned long vaddr, prev_page_paddr;
+	int phys_contiguous = 1;
+
+	WARN_ON(!gmr->page_table); /* XXX - drop this */
+
+	/* check for physically contiguous IO range */
+	vaddr = vma->vm_start;
+	prev_page_paddr = gmr->page_table->pages[0]->physical_address;
+	for (p = 1; p < gmr->page_table->entries; ++p) {
+		struct nvidia_p2p_page *page = gmr->page_table->pages[p];
+		unsigned long page_paddr = page->physical_address;
+		if (prev_page_paddr + NV_GPU_PAGE_SIZE != page_paddr) {
+			phys_contiguous = 0;
+			break;
+		}
+		prev_page_paddr = page_paddr;
+	}
+
+	if (phys_contiguous) {
+		size_t len = min(size,
+				 NV_GPU_PAGE_SIZE * gmr->page_table->entries);
+		unsigned long page0_paddr =
+			gmr->page_table->pages[0]->physical_address;
+		ret = gdr_mmap_phys_mem_wcomb(vma, vaddr, page0_paddr, len);
+		if (ret)
+			goto out;
+
+	} else {
+		/*
+		 * If not contiguous, map individual GPU pages separately.
+		 * In this case, write-combining performance can be really
+		 * bad, not sure why.
+		 */
+		p = 0;
+		while (size && p < gmr->page_table->entries) {
+			struct nvidia_p2p_page *page =
+						gmr->page_table->pages[p];
+			unsigned long page_paddr = page->physical_address;
+			size_t len = min(NV_GPU_PAGE_SIZE, size);
+
+			ret = gdr_mmap_phys_mem_wcomb(vma, vaddr, page_paddr,
+						      len);
+			if (ret)
+				goto out;
+
+			vaddr += len;
+			size -= len;
+			++p;
+		}
+	}
+
+out:
+	return ret;
+}
+#elif defined(INTEL_GPU_DIRECT)
+static int gdr_mmap(struct gdr_mr *gmr, struct vm_area_struct *vma)
+{
+	/*
+	 * It should be noted that the application must pass in the
+	 * base address and the entire allocation len. Consequently,
+	 * the pgoff argument is set to 0. If the application needs to
+	 * mmap part of the entire buffer with a start address different
+	 * from the allocation start address, it should pass in the
+	 * base address and the request address. In that case, the
+	 * application/kernel ABI needs to be changed accordingly.
+	 */
+	return dma_buf_mmap(gmr->dbuf, vma, 0);
+}
+#endif /* NVIDIA_GPU_DIRECT */
+
 /**
- * rv_gdr_mmap() - This driver's mmap handler.
+ * rv_gdr_mmap() - This driver's mmap handler for GPU ops.
  * @filep: A pointer to the open file structure for this file.
  * @vma: A pointer to the vma_area struct.
  *
@@ -1004,100 +1445,49 @@ static int gdr_mmap_phys_mem_wcomb(struct vm_area_struct *vma,
  * 0 - success,
  * -EINVAL - The requested gpu buffer description is invalid
  */
-static int rv_gdr_mmap(struct file *filep, struct vm_area_struct *vma)
+int rv_gdr_mmap(struct file *filep, struct rv_gdrdata *gd,
+		struct vm_area_struct *vma)
 {
 	int ret = 0;
-	size_t size = vma->vm_end - vma->vm_start;
-	struct rv_gdrdata *gd = filep->private_data;
-	struct gdr_mr *mr;
-	int p = 0;
-	unsigned long vaddr, prev_page_paddr;
-	int phys_contiguous = 1;
+	struct gdr_mr *gmr;
+
+	if (!rv_gdr_enabled(gd))
+		return -EINVAL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
 
 	mutex_lock(&gd->mr_lock);
 
-	mr = gd->map_this_mr;
-	/*
-	 * map_this_mr being NULL indicates that the user has
-	 * called mmap directly on this file descriptor.  We want
-	 * to fail this mmap attempt.
-	 */
-	if (!mr) {
+	gmr = gd->map_this_mr;
+	if (!gmr) {	/* direct user call of mmap */
+		rv_err(gd->rv_inx, "direct user mmap call for GPU\n");
 		ret = -EINVAL;
 		goto out;
 	}
 
-	/*
-	 * If the handle value from vm_pgoff does not match mr_handle,
-	 * this means the user has called mmap() system call and
-	 * raced with the ioctl() calling vm_mmap(). Fail this case as well.
-	 */
-	if (mr->mr_handle != handle_from_vm_pgoff(vma->vm_pgoff)) {
+	if (gmr->mr_handle != handle_from_vm_pgoff(vma->vm_pgoff)) {
+		rv_err(gd->rv_inx,
+		       "direct user mmap call for GPU, wrong offset\n");
 		ret = -EINVAL;
 		goto out;
 	}
+#ifdef NVIDIA_GPU_DIRECT
+	if (gmr->mrc.entry.freeing) /* XXX - drop this */
+		rv_err(gmr->rv_inx, "mmap race with free_callback\n");
+	trace_rv_gdr_mr_mmap(gmr->rv_inx, gmr->mrc.entry.addr,
+			     gmr->mrc.entry.len, gmr->mrc.entry.access);
+#else
+	if (gmr->mrc.entry.freeing) /* XXX - drop this */
+		rv_err(gmr->rv_inx, "mmap race with invalidate\n");
+	trace_rv_gdr_mr_mmap(gmr->rv_inx, gmr->mrc.entry.addr,
+			     gmr->mrc.entry.len, gmr->alloc_id,
+			     gmr->base_addr, gmr->mrc.entry.access,
+			     gmr->ipc_handle);
+#endif
+	trace_rv_gdr_msg_mmap(gmr->rv_inx, "gmr, freeing", (u64)gmr,
+			      gmr->mrc.entry.freeing);
 
-	/*
-	 * This code path lost a race with the free callback handler,
-	 * which has unpinned and unmapped this GPU buffer.
-	 */
-	if (!mr->page_table) {
-		ret = -EINVAL;
-		goto out;
-	}
-
-	/*
-	 * check for physically contiguous IO range
-	 */
-	vaddr = vma->vm_start;
-	prev_page_paddr = mr->page_table->pages[0]->physical_address;
-	phys_contiguous = 1;
-	for (p = 1; p < mr->page_table->entries; ++p) {
-		struct nvidia_p2p_page *page = mr->page_table->pages[p];
-		unsigned long page_paddr = page->physical_address;
-		if (prev_page_paddr + NV_GPU_PAGE_SIZE != page_paddr) {
-			phys_contiguous = 0;
-			break;
-		}
-		prev_page_paddr = page_paddr;
-	}
-
-	if (phys_contiguous) {
-		size_t len = min(size,
-				 NV_GPU_PAGE_SIZE * mr->page_table->entries);
-		unsigned long page0_paddr =
-			mr->page_table->pages[0]->physical_address;
-		ret = gdr_mmap_phys_mem_wcomb(vma,
-					      vaddr,
-					      page0_paddr,
-					      len);
-		if (ret)
-			goto out;
-
-	} else {
-		/*
-		 * If not contiguous, map individual GPU pages separately.
-		 * In this case, write-combining performance can be really
-		 * bad, not sure why.
-		 */
-		p = 0;
-		while (size && p < mr->page_table->entries) {
-			struct nvidia_p2p_page *page = mr->page_table->pages[p];
-			unsigned long page_paddr = page->physical_address;
-			size_t len = min(NV_GPU_PAGE_SIZE, size);
-
-			ret = gdr_mmap_phys_mem_wcomb(vma,
-						      vaddr,
-						      page_paddr,
-						      len);
-			if (ret)
-				goto out;
-
-			vaddr += len;
-			size -= len;
-			++p;
-		}
-	}
+	ret = gdr_mmap(gmr, vma);
 
 out:
 	mutex_unlock(&gd->mr_lock);
@@ -1106,123 +1496,396 @@ out:
 }
 
 /**
- * rv_gdr_release() - This is the release function for this handler.
- * @inode: A pointer to the inode form this file.
- * @filep: A pointer to the open file structure for this file.
- *
- * This function unpins and unmaps all gpu buffers in the list of
- * struct gdr_mr structures.
+ * rv_ioctl_gpu_reg_mem() - process the reg_mem for GPU address
+ */
+int
+rv_ioctl_gpu_reg_mem(struct file *fp, struct rv_user *rv, struct rv_gdrdata *gd,
+		     struct rv_mem_params *mparams)
+{
+	struct gdr_mr *gmr = NULL;
+	int ret = 0;
+	struct rv_mr_cache_entry *mrce;
+	u64 offset = 0; /* for a cache hit with superset */
+
+#ifdef INTEL_GPU_DIRECT
+	if (!mparams->in.ipc_handle) {
+		rv_err(rv->inx, "No ipc_handle for reg gpu mr\n");
+		return -EINVAL;
+	}
+#endif
+	if (!rv_gdr_enabled(gd))
+		return -EINVAL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
+	if (atomic_cmpxchg(&gd->ioctl_busy_flag, 0, 1))
+		return -EINVAL;
+
+	mutex_lock(&gd->mr_lock);
+#ifdef INTEL_GPU_DIRECT
+search_again:
+#endif
+	mrce = rv_mr_cache_search_get(&gd->cache, mparams->in.addr,
+				      mparams->in.length, mparams->in.access,
+#ifdef INTEL_GPU_DIRECT
+				      false, true);
+#else
+				      true, true);
+#endif
+	if (IS_ERR(mrce)) {
+		ret = PTR_ERR(mrce);
+		goto unlock;
+	}
+	if (mrce) {
+		gmr = container_of(mrce, struct gdr_mr, mrc.entry);
+#ifdef INTEL_GPU_DIRECT
+		if (gmr->alloc_id != mparams->in.alloc_id) {
+			/* we still have gd->mr_lock so mrce won't go away */
+			rv_mr_cache_entry_put(&gd->cache, mrce);
+			gdr_invalidate(gd, gmr);
+			goto search_again;
+		}
+		rv_mr_cache_inc_hit(&gd->cache);	// was a real hit
+#endif
+		/* If the mrce is a superset, we need to calculate the offset */
+		offset = mparams->in.addr - mrce->addr;
+		if (!gmr->mrc.mr.ib_mr) {
+			struct rv_mem_params mparams_c;
+
+			/*
+			 * The mmap pin and mr pin are different.
+			 * Therefore, more actions are required before the
+			 * cache entry can be used. This is true for both
+			 * dma_buf and Nvidia GPU.
+			 */
+			ret = pin_gpu_buf_promote(gmr);
+			if (ret) {
+				gd->stats.failed_reg++;
+				goto bail_put;
+			}
+			/*
+			 * The mrce could be a superset and therefore we can't
+			 * register with mparams->in itself. Other than the
+			 * addr/length fields, other fields should be the same
+			 * (access, ipc_handle, alloc_id, base_addr, etc).
+			 */
+			memcpy(&mparams_c, mparams, sizeof(mparams_c));
+			mparams_c.in.addr = mrce->addr;
+			mparams_c.in.length = mrce->len;
+			ret = rv_drv_api_reg_mem(rv, &mparams_c.in,
+						 &gmr->mrc.mr);
+			if (ret) {
+				gd->stats.failed_reg++;
+				goto bail_put;	/* keep mmap entry */
+			}
+#ifdef INTEL_GPU_DIRECT
+			trace_rv_gdr_mr_reg_mem(gmr->rv_inx, mparams_c.in.addr,
+						mparams_c.in.length,
+						mparams_c.in.alloc_id,
+						mparams_c.in.base_addr,
+						mparams_c.in.access,
+						mparams_c.in.ipc_handle);
+#else
+			trace_rv_gdr_mr_reg_mem(gmr->rv_inx, mparams_c.in.addr,
+						mparams_c.in.length,
+						mparams_c.in.access);
+#endif
+			trace_rv_gdr_msg_reg_mem(gmr->rv_inx, "gmr, iova",
+						 (u64)gmr,
+						 gmr->mrc.mr.ib_mr->iova);
+			WARN_ON(!gmr->host_addr);
+			gd->stats.hit_add_reg++;
+			rv_mr_cache_entry_promote(&gd->cache, mrce);
+		} else {
+			gd->stats.hit_reg++;
+		}
+		goto skip_pin_reg;
+	}
+	gmr = do_pin_gpu_buf(gd, mparams->in.addr, mparams->in.length,
+#ifdef NVIDIA_GPU_DIRECT
+			     mparams->in.access,
+#else
+			     mparams->in.access, mparams->in.ipc_handle,
+			     mparams->in.alloc_id, mparams->in.base_addr,
+#endif
+			     false);
+	if (IS_ERR(gmr)) {
+		/* if unable to pin (out of BAR) let PSM evict and retry */
+		ret = PTR_ERR(gmr);
+		goto unlock;
+	}
+	ret = rv_drv_api_reg_mem(rv, &mparams->in, &gmr->mrc.mr);
+	if (ret) {
+		WARN_ON(gmr->mrc.mr.ib_mr); /* XXX drop this */
+		gd->stats.failed_reg++;
+		goto bail_unpin;
+	}
+	gmr->mrc.entry.type = RV_MRCE_TYPE_REG;
+#ifdef INTEL_GPU_DIRECT
+	trace_rv_gdr_mr_reg_mem(gmr->rv_inx, mparams->in.addr,
+				mparams->in.length, mparams->in.alloc_id,
+				mparams->in.base_addr, mparams->in.access,
+				mparams->in.ipc_handle);
+#else
+	trace_rv_gdr_mr_reg_mem(gmr->rv_inx, mparams->in.addr,
+				mparams->in.length, mparams->in.access);
+#endif
+	trace_rv_gdr_msg_reg_mem(gmr->rv_inx, "gmr, iova",
+				 (u64)gmr, gmr->mrc.mr.ib_mr->iova);
+	/* If need to evict, this will release and reaqcuire mr_lock */
+	ret = rv_mr_cache_insert(&gd->cache, &gmr->mrc.entry);
+	if (ret) {
+		rv_err(rv->inx, "failed to insert gdr cache %d\n", ret);
+		goto bail_dereg;
+	}
+skip_pin_reg:
+	mparams->out.mr_handle = (uint64_t)gmr;
+	mparams->out.iova = gmr->mrc.mr.ib_mr->iova + offset;
+	mparams->out.lkey = gmr->mrc.mr.ib_mr->lkey;
+	mparams->out.rkey = gmr->mrc.mr.ib_mr->rkey;
+unlock:
+	mutex_unlock(&gd->mr_lock);
+	WARN_ON(atomic_read(&gd->ioctl_busy_flag) != 1);
+	atomic_set(&gd->ioctl_busy_flag, 0);
+	return ret;
+
+bail_dereg:
+bail_unpin:
+	rv_err(rv->inx, "fail reg: gmr %p\n", gmr);
+	/* not in cache yet so can't call rv_mr_cache_put */
+	rv_mr_cache_entry_deinit(&gmr->mrc.entry);
+	/* remove checks more than needed, but ok */
+	gdr_cache_mrce_remove(&gd->cache, gd, &gmr->mrc.entry, 0);
+	goto unlock;
+
+bail_put:
+	rv_err(rv->inx, "put on failed reg: gmr %p\n", gmr);
+	rv_mr_cache_put(&gd->cache, &gmr->mrc.entry, true);
+	goto unlock;
+}
+
+/**
+ * rv_ioctl_gpu_dereg_mem() - process the dereg_mem for GPU address
+ */
+int
+rv_ioctl_gpu_dereg_mem(struct rv_gdrdata *gd,
+		       struct rv_dereg_params_in *dparams)
+{
+	int ret = 0;
+	struct rv_mr_cache_entry *mrce;
+
+	if (!rv_gdr_enabled(gd))
+		return -EINVAL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
+	if (atomic_cmpxchg(&gd->ioctl_busy_flag, 0, 1))
+		return -EINVAL;
+
+	mutex_lock(&gd->mr_lock);
+	mrce = rv_mr_cache_search_put(&gd->cache, dparams->addr, dparams->length, dparams->access,
+				      (struct rv_mr_cached *)dparams->mr_handle);
+	if (IS_ERR(mrce))
+		ret = -EINVAL;
+	mutex_unlock(&gd->mr_lock);
+	WARN_ON(atomic_read(&gd->ioctl_busy_flag) != 1);
+	atomic_set(&gd->ioctl_busy_flag, 0);
+	return ret;
+}
+
+/**
+ * rv_gdr_map_verbs_mr
  *
  * Return:
- * 0 - success
+ * >0 - success, number of sgl mapped
+ * -EINVAL - The requested gpu buffer description is invalid
+ *  caller holds gd->mr_lock
  */
-static int rv_gdr_release(struct inode *inode, struct file *filep)
+int rv_gdr_map_verbs_mr(int rv_inx, struct mr_info *mr,
+			struct rv_mem_params_in *minfo)
 {
-	struct gdr_mr *mr;
-	struct rv_mr_cached *mrc;
-	struct rv_gdrdata *gd = filep->private_data;
+	int ret = 0;
+	struct gdr_mr *gmr = container_of(mr, struct gdr_mr, mrc.mr);
+	struct scatterlist *sgl;	/* list */
+	unsigned int nents = 0;
+	unsigned int offset;
+	int num;
+	struct scatterlist *sg;		/* iterator for sgl */
+	int i;
+	u64 addr;
+	u64 tlen;
+	unsigned int len;
+	u32 max_sg;
+#ifdef INTEL_GPU_DIRECT
+	u64 start, end, dbuf_offset;
+	struct scatterlist *dsg; /* sg from dma_buf */
+#endif
 
-	filep->private_data = NULL;
+	if (!rv_gdr_enabled(gmr->gd))
+		return -EINVAL;
+	if (gmr->gd->tgid != task_tgid(current) || !current->mm)
+		return -EINVAL;
 
+#ifdef INTEL_GPU_DIRECT
+	trace_rv_gdr_mr_map_verbs_mr(rv_inx, gmr->mrc.entry.addr,
+				     gmr->mrc.entry.len, gmr->alloc_id,
+				     gmr->base_addr, gmr->mrc.entry.access,
+				     gmr->ipc_handle);
+	if (gmr->mrc.entry.freeing) /* XXX - drop this */
+		rv_err(gmr->rv_inx, "reg_mr race with invalidate\n");
+#else
+	trace_rv_gdr_mr_map_verbs_mr(rv_inx, gmr->mrc.entry.addr,
+				     gmr->mrc.entry.len,
+				     gmr->mrc.entry.access);
+	if (gmr->mrc.entry.freeing) /* XXX - drop this */
+		rv_err(gmr->rv_inx, "reg_mr race with free_callback\n");
+#endif
+	trace_rv_gdr_msg_map_verbs_mr(rv_inx, "gmr, freeing", (u64)gmr,
+				      gmr->mrc.entry.freeing);
+#ifdef NVIDIA_GPU_DIRECT
+	WARN_ON(!gmr->dma_mapping); /* XXX - drop this */
+
+	nents = gmr->dma_mapping->entries;
+#elif defined(INTEL_GPU_DIRECT)
+	nents = gmr->sg_table->nents;
+#endif
+	if (!nents)
+		return -EINVAL;
+
+	/* Allocate a kernel verbs mr */
+#ifdef NVIDIA_GPU_DIRECT
+	max_sg = nents * (GPU_PAGE_SIZE >> PAGE_SHIFT);
+#else
+	start = ALIGN_DOWN(minfo->addr, GPU_PAGE_SIZE);
+	end = ALIGN(minfo->addr + minfo->length, GPU_PAGE_SIZE);
+	max_sg = (end - start) >>  PAGE_SHIFT;
+#endif
+	mr->ib_mr = ib_alloc_mr(mr->ib_pd, IB_MR_TYPE_MEM_REG, max_sg);
+	if (IS_ERR(mr->ib_mr)) {
+		rv_err(rv_inx, "Failed to alloc kernel verbs mr: %ld\n",
+		       PTR_ERR(mr->ib_mr));
+		ret = PTR_ERR(mr->ib_mr);
+		mr->ib_mr = NULL;
+		return ret;
+	}
+
+	offset = minfo->addr & (GPU_PAGE_SIZE - 1);
+	/* build a scatterlist, page_link is empty and offset==0 for each */
+	/* we are doing peer2peer DMA, so we shouldn't need to map in IOMMU */
+	sgl = kmalloc_array(nents, sizeof(struct scatterlist), GFP_KERNEL);
+	if (!sgl) {
+		ret = -ENOMEM;
+		goto bail_mr;
+	}
+	sg_init_table(sgl, nents);
+	tlen = minfo->length + offset;
+#ifdef INTEL_GPU_DIRECT
+	dsg = gmr->sg_table->sgl;
+	/*
+	 * dsg points to the start of the dma_buf and we need to walk to
+	 * the correct offset.
+	 */
+	dbuf_offset = gmr->mrc.entry.addr - gmr->base_addr;
+	while (dbuf_offset > 0 && dsg) {
+		if (sg_dma_len(dsg) > dbuf_offset)
+			break;
+		dbuf_offset -= sg_dma_len(dsg);
+		dsg = sg_next(dsg);
+	}
+	if (!dsg) {
+		rv_err(rv_inx,
+		       "Short sg_table: addr 0x%llx base 0x%llx rem offset 0x%llx\n",
+		       gmr->mrc.entry.addr, gmr->base_addr, dbuf_offset);
+		ret = -EINVAL;
+		goto bail_mr;
+	}
+	trace_rv_gdr_msg_map_verbs_mr(rv_inx, "dbuf_offset, sg_dma_len",
+				      dbuf_offset, sg_dma_len(dsg));
+#endif
+	for_each_sg(sgl, sg, nents, i) {
+#ifdef NVIDIA_GPU_DIRECT
+		addr = gmr->dma_mapping->dma_addresses[i];
+#else
+		addr = sg_dma_address(dsg) + dbuf_offset;
+#endif
+		trace_rv_gdr_msg_map_verbs_mr(rv_inx, "i, dma_address", i,
+					      addr);
+		sg_dma_address(sg) = addr;
+#ifdef NVIDIA_GPU_DIRECT
+		len = tlen > GPU_PAGE_SIZE ?
+			GPU_PAGE_SIZE : (unsigned int)tlen;
+#else
+		len = sg_dma_len(dsg) - dbuf_offset;
+		len = len > tlen ? tlen : len;
+#endif
+		trace_rv_gdr_msg_map_verbs_mr(rv_inx, "i, len", i, len);
+		sg->length = len;
+		sg_dma_len(sg) = len;
+		tlen -= len;
+		if (!tlen) {
+			i++;
+			break;
+		}
+#ifdef INTEL_GPU_DIRECT
+		/* dbuf_offset is only applicable to the first dsg */
+		if (dbuf_offset)
+			dbuf_offset = 0;
+		dsg = sg_next(dsg);
+		if (!dsg) {
+			rv_err(rv_inx,
+			       "Short sg_table: addr 0x%llx base 0x%llx rem tlen %llu\n",
+			       gmr->mrc.entry.addr, gmr->base_addr, tlen);
+			ret = -EINVAL;
+			goto bail_mr;
+		}
+#endif
+	}
+	nents = i;
+
+	trace_rv_gdr_msg_map_verbs_mr(rv_inx, "offset, page_size", offset,
+				      PAGE_SIZE);
+	num = ib_map_mr_sg(mr->ib_mr, sgl, nents, &offset, PAGE_SIZE);
+	if (num < (int)nents) {
+		rv_err(rv_inx, "Failed to map GPU gmr: %d %d\n", num, nents);
+		if (num < 0)
+			ret = num; /* what error code does driver return? */
+		else
+			ret = -EINVAL;	/* driver misbehaved */
+		goto bail_mr;
+	} else {
+		ret = num;
+	}
+	goto free_sgl;
+
+bail_mr:
+	ib_dereg_mr(mr->ib_mr);
+	mr->ib_mr = NULL;
+free_sgl:
+	kfree(sgl);
+	return ret;
+}
+
+/* for RDMA WQE handling */
+/* Could return an ERROR for GPU if MR is stale ("freeing") */
+struct rv_mr_cache_entry *rv_gdr_search_get(struct rv_gdrdata *gd,
+					    struct rv_post_write_params *params)
+{
+	struct rv_mr_cache_entry *mrce;
+
+	if (!rv_gdr_enabled(gd))
+		return NULL;
+	if (gd->tgid != task_tgid(current) || !current->mm)
+		return NULL;
 	mutex_lock(&gd->mr_lock);
-	while ((mrc = rv_mr_cache_first(gd->gdr_cache))) {
-		mr = container_of(mrc, struct gdr_mr, mrc);
-		acquire_ioctl_mr_ref(mr);
-		mutex_unlock(&gd->mr_lock);
-		do_munmap_and_unpin_gpu_buf(mr);
-		mutex_lock(&gd->mr_lock);
-	}
+	mrce = rv_mr_cache_search_get(&gd->cache,
+				      params->in.loc_mr_addr,
+				      params->in.loc_mr_length,
+				      params->in.loc_mr_access,
+				      false, false);
 	mutex_unlock(&gd->mr_lock);
-
-	// rv_mr_cache_unregister(gd->gdr_cache); /* XXX Not implemented yet! */
-
-	kfree(gd);
-
-	return 0;
+	return mrce;
 }
 
-static char *gdr_devnode(struct device *dev, umode_t *mode)
+/* for RDMA CQE handling */
+void rv_gdr_cache_put(struct rv_gdrdata *gd, struct rv_mr_cache_entry *mrce)
 {
-	if (mode)
-		*mode = 0666;
-	return kasprintf(GFP_KERNEL, "%s", dev_name(dev));
+	rv_mr_cache_put(&gd->cache, mrce, false);
 }
-
-
-static int add_gdr_dev(void)
-{
-	int ret = 0;
-
-	gdr_major = register_chrdev(0, GDR_DRIVER_NAME, &rv_gdr_ops);
-	if (gdr_major < 0) {
-		gdr_major = 0;
-		ret = -ENODEV;
-		goto out;
-	}
-
-	gdr_dev = MKDEV(gdr_major, 0);
-
-	gdr_class = class_create(THIS_MODULE, GDR_CLASS_NAME);
-	if (IS_ERR(gdr_class)) {
-		ret = PTR_ERR(gdr_class);
-		gdr_class = NULL;
-		goto out;
-	}
-
-	gdr_class->devnode = gdr_devnode;
-
-	gdr_device = device_create(gdr_class, NULL, gdr_dev,
-				      NULL, "%s", GDR_DEV_NAME);
-
-	if (IS_ERR(gdr_device)) {
-		ret = -PTR_ERR(gdr_device);
-		gdr_device = NULL;
-		goto out;
-	}
-
-out:
-	return ret;
-}
-
-static void remove_gdr_dev(void)
-{
-	if (gdr_device) {
-		device_unregister(gdr_device);
-		gdr_device = NULL;
-	}
-
-	if (gdr_class) {
-		class_destroy(gdr_class);
-		gdr_class = NULL;
-	}
-
-	if (gdr_major) {
-		unregister_chrdev(gdr_major, GDR_DRIVER_NAME);
-		gdr_major = 0;
-	}
-}
-
-/**
- * rv_gdr_device_create() - Create gdr device and its file in /dev
- *
- * Return: 0 on sucess, negative error code on failure
- */
-int rv_gdr_device_create()
-{
-	int ret = 0;
-
-	ret = add_gdr_dev();
-	if (ret)
-		remove_gdr_dev();
-
-	return ret;
-}
-
-/**
- * rv_gdr_device_remove() - Remove gdr device and its file in /dev
- */
-void rv_gdr_device_remove()
-{
-	remove_gdr_dev();
-}
-

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-DEFAULT_KERNEL_VERSION=""
+DEFAULT_KERNEL_VERSION=$(uname -r)
 kerneldir="./"
 
 modules_cnt=0
@@ -24,14 +24,13 @@ files_to_copy[$modules_cnt]="
 	drivers/infiniband/ulp/rv/trace_mr.h
 	drivers/infiniband/ulp/rv/trace_user.h
 	drivers/infiniband/ulp/rv/trace_rdma.h
-	drivers/infiniband/ulp/rv/trace_misc.h
-	include/uapi/rv/rv_user_ioctls.h
+	include/uapi/rdma/rv_user_ioctls.h
 	"
 
 # Add each module separately
-include_dirs[0]="include/uapi/rv"
+include_dirs[0]="include/uapi/rdma"
 include_files_to_copy[0]="
-	include/uapi/rv/rv_user_ioctls.h
+	include/uapi/rdma/rv_user_ioctls.h
 "
 include_dirs[1]="compat/"
 include_files_to_copy[1]=""
@@ -39,7 +38,6 @@ include_files_to_copy[1]=""
 include_dirs_cnt=${#include_dirs[@]}
 
 # ridiculously long to encourage good names later
-# XXX: should we rename it as efs-kernel-updates?
 rpmname="iefs-kernel-updates"
 
 set -e
@@ -83,6 +81,54 @@ Options:
 EOL
 }
 
+is_up_kernel="No"
+# $1 - Current running kernel (eg "4.18.0-305.el8.x86_64")
+# $2 - Minimum upstream kernel version (eg "5.17.0")
+# Return
+#      Set is_up_kernel to "Yes" if so.
+function check_upstream_kernel() {
+	cur=$1;
+	up=$2;
+
+	# Remove any trailing version info and "+"
+	cur=${cur%%-*}
+	cur=${cur%%+*}
+	up=${up%%-*}
+	up=${up%%+*}
+
+	# Get major version number and remove it from the version string
+	cur_mj=${cur%%.*}
+	up_mj=${up%%.*}
+	cur=${cur#*.}
+	up=${up#*.}
+
+	# Get patch level and sublevel version info
+	cur_pl=${cur%%.*}
+	cur_sl=${cur#*.}
+	up_pl=${up%%.*}
+	up_sl=${up#*.}
+
+	# Build the complete versions into numbers and compare
+	#echo " cur: mj = $cur_mj, pl = $cur_pl, sl = $cur_sl"
+	#echo " up: mj = $up_mj, pl = $up_pl, sl = $up_sl"
+	#cur_num=$(( $cur_mj << 16 + $cur_pl << 8 + $cur_sl ))
+	cur_num=0
+	(( cur_num += (cur_mj << 16) ))
+	(( cur_num += (cur_pl << 8) ))
+	(( cur_num += cur_sl ))
+	#up_num=$(( $up_mj << 16 + $up_pl << 8 + $up_sl ))
+	up_num=0
+	(( up_num += (up_mj << 16) ))
+	(( up_num += (up_pl << 8) ))
+	(( up_num += up_sl ))
+	#echo "cur_num = $cur_num, up_num = $up_num"
+	# For some reason, "return X" exits the entire script, not just
+	# this function.
+	if [[ $cur_num -ge $up_num ]]; then
+		is_up_kernel="Yes";
+	fi
+}
+
 gpubuild="false"
 srcdir=""
 workdir=""
@@ -91,6 +137,8 @@ ifs_distro=""
 distro=""
 distro_dir=""
 compat_dir=""
+# Make sure to update this variable when a new distro is added
+upstream_kernel="6.15.0"
 while getopts ":GS:hw:" opt; do
     	case "$opt" in
 	G)	gpubuild="true"
@@ -108,7 +156,16 @@ while getopts ":GS:hw:" opt; do
     	esac
 done
 
-if [[ $ID == "rhel" ]]; then
+# Check if the running kernel is a upstream kernel.
+# Be sure to update upstream_kernel variable when a new
+# distro with a newer kernel is introduced.
+
+echo "kernel_version = $DEFAULT_KERNEL_VERSION"
+echo "upstream_kernel = $upstream_kernel"
+check_upstream_kernel ${DEFAULT_KERNEL_VERSION} ${upstream_kernel}
+if [[ $is_up_kernel == "Yes" ]]; then
+	compat_dir=UPSTRM;
+elif [[ $ID == "rhel" ]] || [[ $ID == "rocky" ]]; then
 	compat_dir=RH$VERSION_ID_MAJOR$VERSION_ID_MINOR
 elif [[ $ID == "sles" ]]; then
 	if [[ -z $VERSION_ID_MINOR ]]; then
@@ -153,10 +210,10 @@ include_files_to_copy[1]="
 
 if [ $gpubuild = 'true' ]; then
 	files_to_copy[0]+="
-		drivers/infiniband/ulp/rv/gpu.c
 		drivers/infiniband/ulp/rv/gpu.h
 		drivers/infiniband/ulp/rv/gdr_ops.c
 		drivers/infiniband/ulp/rv/gdr_ops.h
+		drivers/infiniband/ulp/rv/trace_gpu.h
 	"
 fi
 
@@ -175,6 +232,7 @@ done
 echo "Working in $workdir"
 
 echo "NVIDIA env var: $NVIDIA_GPU_DIRECT"
+echo "INTEL GPU env var: $INTEL_GPU_DIRECT"
 
 # create the Makefiles
 echo "Creating Makefile ($tardir/Makefile)"
@@ -198,8 +256,6 @@ if [[ ! -s $srcdir/compat/$compat_dir/compat.c ]]; then
 	sed -i "s/compat.o//g" $tardir/rv/Makefile
 fi
 
-DEFAULT_KERNEL_VERSION=$(uname -r)
-
 if [ "$DEFAULT_KERNEL_VERSION" == "" ]; then
 	echo "Unable to generate the kernel version"
 	exit 1
@@ -209,12 +265,16 @@ if echo $srcdir | grep -q "components";  then
 	rpmrelease=$(git rev-list WFR_driver_first..HEAD -- $srcdir | wc -l)
 	echo "ifs-all build"
 else
-	rpmrelease=$(cd "$srcdir"; git rev-list "WFR_driver_first..HEAD" | wc -l)
-	echo "wfr-linux-devel build"
+	rpmrelease=$(cd "$srcdir"; git rev-list HEAD | wc -l)
+	echo "iefs-kernel-updates build"
 fi
 rpmrelease=$((rpmrelease + 5000))
 if [ $gpubuild = 'true' ]; then
-	rpmrelease+="cuda"
+	if [ "$INTEL_GPU_DIRECT" != "" ]; then
+		rpmrelease+="oneapize"
+	else
+		rpmrelease+="cuda"
+	fi
 fi
 echo "rpmrelease = $rpmrelease"
 
@@ -227,12 +287,20 @@ rpmversion=$(echo "$DEFAULT_KERNEL_VERSION" | sed -e 's/-/_/g')
 rpmrequires=$(echo "$DEFAULT_KERNEL_VERSION" | sed -e 's/.[^.]*$//')
 
 # get kernel(-devel) rpm version and release values
-if [ $distro = 'rhel' ]
+if [ $distro = 'rhel' -o $distro = 'rocky' -o $distro = 'fedora' ]
 then
-	kernel_rpmver=$(rpm -q --qf %{VERSION} kernel-$(uname -r))
+	if [ $is_up_kernel = "Yes" ]; then
+		 kernel_rpmver=${DEFAULT_KERNEL_VERSION%%-*}
+	else
+		kernel_rpmver=$(rpm -q --qf %{VERSION} kernel-$(uname -r))
+	fi
 	kmod_subdir=extra
 else
-	kernel_rpmver=$(rpm -q --qf %{VERSION} kernel-default)
+	if [ $is_up_kernel = "Yes" ]; then
+		kernel_rpmver=${DEFAULT_KERNEL_VERSION%%-*}
+	else
+		kernel_rpmver=$(rpm -q --qf %{VERSION} kernel-default)
+	fi
 	kmod_subdir=updates
 fi
 # create a new $rpmname.conf and $rpmname.files
@@ -286,7 +354,7 @@ cd $workdir
 # create the spec file
 echo "Creating spec file"
 
-if [ $distro = 'rhel' ]
+if [ $distro = 'rhel' -o $distro = 'rocky' -o $distro = 'fedora' ]
 then
 	cp $filedir/$rpmname.spec.rhel $workdir/rpmbuild/SPECS/$rpmname.spec
 else
@@ -298,7 +366,7 @@ sed -i "s/RPMRELEASE/$rpmrelease/g" $workdir/rpmbuild/SPECS/$rpmname.spec
 sed -i "s/RPMVERSION/$rpmversion/g" $workdir/rpmbuild/SPECS/$rpmname.spec
 sed -i "s/MODLIST/$modlist/g" $workdir/rpmbuild/SPECS/$rpmname.spec
 
-if [ $VERSION_ID = '8.0' ]; then
+if [ $VERSION_ID = '8.0' -o $is_up_kernel = 'Yes' ]; then
 	sed -i "s/kernel_source/kbuild/g" $workdir/rpmbuild/SPECS/$rpmname.spec
 fi
 if [[ -n "$MVERSION" ]]; then

@@ -13,7 +13,7 @@
 #include <uapi/rdma/ib_user_verbs.h>
 #include <rdma/ib_verbs.h>
 #include <linux/timer.h>
-#ifdef HAVE_XARRAY
+#if defined(HAVE_XARRAY) || defined(HAVE_MOFED)
 #include <linux/xarray.h>
 #else
 #include <linux/idr.h>
@@ -45,6 +45,10 @@ enum ib_uverbs_advise_mr_advice {
 	IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
 	IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
 };
+#endif
+
+#ifndef HAVE_FALLTHROUGH
+#define fallthrough                    do {} while (0)
 #endif
 
 #ifndef HAVE_IB_DEVICE_OPS
@@ -230,7 +234,10 @@ struct ib_device_ops {
 #else
 	int (*dealloc_pd)(struct ib_pd *pd);
 #endif
-#ifdef CREATE_AH_RETURNS_INT
+#ifdef CREATE_AH_HAS_INIT_ATTR
+	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_init_attr *attr,
+			 struct ib_udata *udata);
+#elif defined(CREATE_AH_RETURNS_INT)
 	int (*create_ah)(struct ib_ah *ah, struct rdma_ah_attr *ah_attr,
 			 u32 flags, struct ib_udata *udata);
 #elif defined(CREATE_AH_HAS_FLAGS)
@@ -478,6 +485,8 @@ struct mmu_notifier_range {
 #define UVERBS_IDR_ANY_OBJECT 0xFFFF
 #endif
 
+/* From: drivers/infiniband/core/uverbs.h */
+
 struct ib_uverbs_device {
 	atomic_t				refcount;
 	int					num_comp_vectors;
@@ -522,6 +531,7 @@ struct ib_uverbs_async_event_file {
 };
 #endif
 
+#ifndef HAVE_STRUCT_IB_UVERBS_FILE
 struct ib_uverbs_file {
 	struct kref				ref;
 	struct ib_uverbs_device		       *device;
@@ -531,8 +541,14 @@ struct ib_uverbs_file {
 	 * ucontext_lock held
 	 */
 	struct ib_ucontext		       *ucontext;
+#ifndef UVERBS_FILE_NO_EVENT_HANDLER
 	struct ib_event_handler			event_handler;
+#endif
+#ifdef UVERBS_FILE_HAS_DEFAULT_ASYNC_FILE
+	struct ib_uverbs_async_event_file       *default_async_file;
+#else
 	struct ib_uverbs_async_event_file       *async_file;
+#endif
 	struct list_head			list;
 
 	/*
@@ -554,7 +570,6 @@ struct ib_uverbs_file {
 #ifdef UVERBS_FILE_HAVE_CMD_MASK
 	u64 uverbs_cmd_mask;
 	u64 uverbs_ex_cmd_mask;
-
 #endif
 
 #ifdef UVERBS_FILE_HAVE_XARRAY_IDR
@@ -567,6 +582,7 @@ struct ib_uverbs_file {
 	spinlock_t		idr_lock;
 #endif
 };
+#endif /* HAVE_STRUCT_IB_UVERBS_FILE */
 
 /* NOTE THIS PART EXTRACTED FROM rdma_core.h */
 #ifndef UVERBS_API_NO_WRITE_METHOD
@@ -583,13 +599,18 @@ struct uverbs_api_write_method {
 
 /*
  * Original source file:
- * include/rdma/uverbs_std_types.h: rhel 7.9/8.1/8.2/8.3, sles15.2
+ * include/rdma/uverbs_std_types.h: rhel 7.9/8.1/8.2/8.3/8.4/8.5/8.6,
+ *                                  sles 15.2/15.3
  * drivers/infiniband/core/rdma_core.h: sles15.1,
  */
 #ifdef NO_UVERBS_API_OBJECT
 struct uverbs_api_object {
 	const struct uverbs_obj_type *type_attrs;
 	const struct uverbs_obj_type_class *type_class;
+#ifdef UVERBS_API_OBJECT_HAVE_ID
+	u8 disabled:1;
+	u32 id;
+#endif
 };
 #endif
 
@@ -628,6 +649,11 @@ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
     return res;
 }
 
+#ifndef HAVE_PROTOTYPE_RDMA_LOOKUP_GET_UOBJECTS
+/*
+ * Newer distros have these two prototypes in include/rmda/uverbs_types.h and
+ * therefore may not need them at all.
+ */
 struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_api_object *obj,
                                            struct ib_uverbs_file *ufile, s64 id,
 #ifndef RDMA_LOOKUP_GET_UOBJECT_HAVE_ATTR
@@ -636,14 +662,12 @@ struct ib_uobject *rdma_lookup_get_uobject(const struct uverbs_api_object *obj,
 					   enum rdma_lookup_mode mode,
 					   struct uverbs_attr_bundle *attrs);
 #endif
+#endif /* HAVE_PROTOTYPE_RDMA_LOOKUP_GET_UOBJECTS */
 
 void rdma_lookup_put_uobject(struct ib_uobject *uobj,
                              enum rdma_lookup_mode mode);
 
-#endif
-
-
-#ifndef HAVE_XARRAY
+#if !defined(HAVE_XARRAY) && !defined(HAVE_MOFED)
 struct xarray {
 	struct idr table;
 	spinlock_t lock;
@@ -717,17 +741,19 @@ struct xa_state {
 
 static inline void *xas_store(struct xa_state *xas, void *entry)
 {
-	void *old_entry = NULL;
+	void *old_entry;
 
 	spin_lock(&xas->xa->lock);
-	if (entry == NULL)
+	if (entry == NULL) {
 #ifdef IDR_REMOVE_NO_RETURN
+		old_entry = idr_find(&xas->xa->table, xas->index);
 		idr_remove(&xas->xa->table, xas->index);
 #else
 		old_entry = idr_remove(&xas->xa->table, xas->index);
 #endif
-	else
+	} else {
 		old_entry = idr_replace(&xas->xa->table, entry, xas->index);
+	}
 	spin_unlock(&xas->xa->lock);
 	return old_entry;
 }
@@ -779,4 +805,6 @@ static inline void xa_destroy(struct xarray *xa)
 	     ((entry) = idr_get_next(&(xa)->table, (int *)&(id))) != NULL; \
 	     ++id)
 
-#endif
+#endif  /* !defined(HAVE_XARRAY) && !defined(HAVE_MOFED) */
+
+#endif /* !defined(COMPAT_COMMON_H) */

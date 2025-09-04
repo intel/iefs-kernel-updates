@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 
-#define DRAIN_TIMEOUT 5 /* in seconds */
+#define DRAIN_TIMEOUT 20 /* in seconds */
+#define NO_ERR_TO_ERR /* handle drivers which lack ERR->ERR state transition */
+#undef USE_IB_DRAIN /* use ib_drain_qp without timeout handling */
 
 #include <rdma/ib_marshall.h>
+#include <linux/nospec.h>
 
 #include "rv.h"
 #include "trace.h"
@@ -24,7 +27,8 @@ static void rv_sconn_hb_func(struct timer_list *timer);
 static void rv_sconn_hb_work(struct work_struct *work);
 static void rv_hb_done(struct ib_cq *cq, struct ib_wc *wc);
 static void rv_sconn_enter_disconnecting(struct rv_sconn *sconn,
-					 const char *reason);
+					 const char *reason,
+					 const char *add_reason);
 static void rv_sconn_done_disconnecting(struct rv_sconn *sconn);
 #ifdef RV_ENABLE_DRAIN_TIMEOUT
 static void rv_sconn_drain_timeout_func(struct timer_list *timer);
@@ -102,6 +106,7 @@ static void rv_sconn_deinit(struct rv_sconn *sconn)
 
 	rv_sconn_free_primary_path(sconn);
 }
+
 #ifdef DRAIN_WQ
 /*
  * We flush wq2 to ensure all prior QP drain/destroy workitems items
@@ -115,8 +120,8 @@ static void rv_handle_free_conn(struct work_struct *work)
 
 	trace_rv_conn_release(conn, conn->rem_addr, conn->ah.is_global,
 			      conn->ah.dlid,
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[0])),
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[8])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[0])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[8])),
 			      conn->num_conn, conn->next,
 			      conn->jdev, kref_read(&conn->kref));
 	rv_flush_work2();
@@ -130,8 +135,8 @@ static void rv_conn_release(struct rv_conn *conn)
 
 	trace_rv_conn_release(conn, conn->rem_addr, conn->ah.is_global,
 			      conn->ah.dlid,
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[0])),
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[8])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[0])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[8])),
 			      conn->num_conn, conn->next,
 			      conn->jdev, kref_read(&conn->kref));
 
@@ -246,7 +251,7 @@ static u64 rv_sconn_time_elapsed(struct rv_sconn *sconn)
  */
 #define RV_MAX_ADDR_STR 40
 
-char *show_gid(char *buf, size_t size, const u8 *gid)
+static char *show_gid(char *buf, size_t size, const u8 *gid)
 {
 	if (ipv6_addr_v4mapped((struct in6_addr *)gid))
 		snprintf(buf, size, "%pI4", &gid[12]);
@@ -255,7 +260,7 @@ char *show_gid(char *buf, size_t size, const u8 *gid)
 	return buf;
 }
 
-char *show_rem_addr(char *buf, size_t size, struct rv_sconn *sconn)
+static char *show_rem_addr(char *buf, size_t size, struct rv_sconn *sconn)
 {
 	struct rv_conn *conn = sconn->parent;
 
@@ -266,16 +271,11 @@ char *show_rem_addr(char *buf, size_t size, struct rv_sconn *sconn)
 	return buf;
 }
 
-static bool rv_jdev_protocol_roce(struct rv_job_dev *jdev)
-{
-	return rdma_protocol_roce(jdev->dev->ib_dev, jdev->port_num);
-}
-
-const char *get_device_name(struct rv_sconn *sconn)
+static const char *get_device_name(struct rv_sconn *sconn)
 {
 	struct ib_device *ib_dev = sconn->parent->jdev->dev->ib_dev;
 
-	if (ib_dev && ib_dev->name)
+	if (ib_dev)
 		return ib_dev->name;
 	else
 		return "unknown";
@@ -284,43 +284,47 @@ const char *get_device_name(struct rv_sconn *sconn)
 /*
  * Move to the new state and handle basic transition activities
  *
- * rv_conn.mutex must be held
+ * rv_sconn.mutex must be held
  * reason - used in log messages for transitions out of RV_CONNECTED
  *	or to RV_ERROR
  */
 static void rv_sconn_set_state(struct rv_sconn *sconn, enum rv_sconn_state new,
-			       const char *reason)
+			       const char *reason, const char *add_reason,
+			       bool quiet)
 {
 	enum rv_sconn_state old = sconn->state;
 	char buf[RV_MAX_ADDR_STR];
 
 	/* some log messages for major transitions */
-	if (old == RV_CONNECTED && new != RV_CONNECTED)
+	if (old == RV_CONNECTED && new != RV_CONNECTED && !quiet)
 		rv_conn_err(sconn,
-			    "Conn Lost to %s via %s: sconn inx %u qp %u: %s\n",
+			    "Conn Lost to %s via %s: sconn inx %u qp %u: %s%s\n",
 			    show_rem_addr(buf, sizeof(buf), sconn),
 			    get_device_name(sconn), sconn->index,
-			    sconn->qp ? sconn->qp->qp_num : 0, reason);
+			    sconn->qp ? sconn->qp->qp_num : 0,
+			    reason, add_reason);
 	if (old != RV_CONNECTED && new == RV_CONNECTED &&
-	    test_bit(RV_SCONN_WAS_CONNECTED, &sconn->flags))
+	    test_bit(RV_SCONN_WAS_CONNECTED, &sconn->flags) && !quiet)
 		rv_conn_err(sconn,
 			    "Reconnected to %s via %s: sconn index %u qp %u\n",
 			    show_rem_addr(buf, sizeof(buf), sconn),
 			    get_device_name(sconn), sconn->index,
 			    sconn->qp ? sconn->qp->qp_num : 0);
-	else if (old != RV_ERROR && new == RV_ERROR) {
+	else if (old != RV_ERROR && new == RV_ERROR && !quiet) {
 		if (test_bit(RV_SCONN_WAS_CONNECTED, &sconn->flags))
 			rv_conn_err(sconn,
-				    "Unable to Reconn to %s via %s: sconn %u qp %u: %s\n",
+				    "Unable to Reconn to %s via %s: sconn %u qp %u: %s%s\n",
 				    show_rem_addr(buf, sizeof(buf), sconn),
 				    get_device_name(sconn), sconn->index,
-				    sconn->qp ? sconn->qp->qp_num : 0, reason);
+				    sconn->qp ? sconn->qp->qp_num : 0,
+				    reason, add_reason);
 		else
 			rv_conn_err(sconn,
-				    "Unable to Connect to %s via %s: sconn %u qp %u: %s\n",
+				    "Unable to Connect to %s via %s: sconn %u qp %u: %s%s\n",
 				    show_rem_addr(buf, sizeof(buf), sconn),
 				    get_device_name(sconn), sconn->index,
-				    sconn->qp ? sconn->qp->qp_num : 0, reason);
+				    sconn->qp ? sconn->qp->qp_num : 0,
+				    reason, add_reason);
 	}
 
 	/*
@@ -443,7 +447,11 @@ static int rv_sconn_move_qp_to_rtr(struct rv_sconn *sconn, u32 *psn)
 		return ret;
 	}
 	if (psn) {
-		*psn = prandom_u32() & 0xffffff;
+#ifdef NO_GET_RANDOM_U32
+		*psn = get_random_int() & 0xffffff;
+#else
+		*psn = get_random_u32() & 0xffffff;
+#endif
 		qp_attr.rq_psn = *psn;
 	}
 	trace_rv_msg_qp_rtr(sconn, sconn->index, "dlid | dqp_num, mtu | rq_psn",
@@ -490,27 +498,66 @@ static int rv_sconn_move_qp_to_rts(struct rv_sconn *sconn)
 }
 
 /*
+ * validate REP basics
+ * - private_data format and version
+ *	rev must always be an exact version we support
+ *	reject rev 0 & 1, only support rev 2
+ * - SRQ
+ */
+static int rv_check_rep_basics(struct rv_sconn *sconn,
+			       const struct ib_cm_rep_event_param *param,
+			       struct rv_rep_priv_data *rep_priv)
+{
+	if (rep_priv->magic != RV_PRIVATE_DATA_MAGIC) {
+		rv_conn_err(sconn,
+			    "Inval CM REP recv: magic 0x%llx expected 0x%llx\n",
+			    rep_priv->magic, RV_PRIVATE_DATA_MAGIC);
+		return -EINVAL;
+	}
+	if (rep_priv->ver != RV_PRIVATE_DATA_VER) {
+		rv_conn_err(sconn,
+			    "Invalid CM REP recv: rv version %d expected %d\n",
+			    rep_priv->ver, RV_PRIVATE_DATA_VER);
+		return -EINVAL;
+	}
+	if (param->srq) {
+		rv_conn_err(sconn, "Invalid srq %d\n", param->srq);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
  * Client side inbound CM REP handler
  * caller must hold a rv_conn reference and the sconn->mutex
  * This func does not release that ref
  */
-static void rv_cm_rep_handler(struct rv_sconn *sconn, const void *private_data)
+static void rv_cm_rep_handler(struct rv_sconn *sconn,
+			      const struct ib_cm_rep_event_param *param,
+			      const void *priv)
 {
 	int ret;
 	struct rv_job_dev *jdev = sconn->parent->jdev;
+	struct rv_rep_priv_data *rep_priv = (struct rv_rep_priv_data *)priv;
+	const char *reason;
+	struct rv_rej_priv_data rej_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_REJ_REASON_LOCAL_ERR,
+		.recoverable = 0,
+	};
+
+	if (rv_check_rep_basics(sconn, param, rep_priv)) {
+		reason = "invalid REP";
+		rej_priv.reason = RV_REJ_REASON_INVALID_REP;
+		goto rej;
+	}
 
 	if (sconn->state != RV_CONNECTING) {
-		/* unexpected */
-		if (!ib_send_cm_rej(sconn->cm_id, IB_CM_REJ_CONSUMER_DEFINED,
-				    NULL, 0, NULL, 0)) {
-			sconn->stats.rej_sent++;
-			trace_rv_msg_cm_rep_handler(sconn, sconn->index,
-						    "Sending REJ reason",
-						(u64)IB_CM_REJ_CONSUMER_DEFINED,
-						(u64)sconn);
-		}
-		rv_sconn_set_state(sconn, RV_ERROR, "unexpected REP");
-		return;
+		reason = "unexpected REP";
+		rej_priv.reason = RV_REJ_REASON_ERROR;
+		goto rej;
 	}
 
 	if (rv_sconn_move_qp_to_rtr(sconn, NULL))
@@ -532,13 +579,13 @@ static void rv_cm_rep_handler(struct rv_sconn *sconn, const void *private_data)
 					  msecs_to_jiffies(jdev->hb_interval);
 		add_timer(&sconn->hb_timer);
 	}
-	rv_sconn_set_state(sconn, RV_CONNECTED, "");
+	rv_sconn_set_state(sconn, RV_CONNECTED, "", "", false);
 	return;
 
 err:
 	/* do not try to retry/recover for fundamental QP errors */
 	if (!ib_send_cm_rej(sconn->cm_id, IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES,
-			    NULL, 0, NULL, 0)) {
+			    NULL, 0, &rej_priv, sizeof(rej_priv))) {
 		u64 val = (u64)IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES;
 
 		sconn->stats.rej_sent++;
@@ -546,29 +593,43 @@ err:
 					    "Sending REJ reason",
 					    val, (u64)sconn);
 	}
-	rv_sconn_set_state(sconn, RV_ERROR, "local error handling REP");
+	rv_sconn_set_state(sconn, RV_ERROR, "local error handling REP", "",
+			   false);
+	return;
+
+rej:
+	if (!ib_send_cm_rej(sconn->cm_id, IB_CM_REJ_CONSUMER_DEFINED,
+			    NULL, 0, &rej_priv, sizeof(rej_priv))) {
+		sconn->stats.rej_sent++;
+		trace_rv_msg_cm_rep_handler(sconn, sconn->index,
+					    "Sending REJ reason",
+					(u64)IB_CM_REJ_CONSUMER_DEFINED,
+					(u64)sconn);
+	}
+	rv_sconn_set_state(sconn, RV_ERROR, reason, "", false);
 }
 
 /*
  * validate REQ basics
  * - private_data format and version
- *	reject rev 0, assume future versions will be forward compatible
+ *	reject rev 0 & 1
+ *	accept >=2, assume future versions will be forward compatible
  * - QP type and APM
  */
 static int rv_check_req_basics(struct ib_cm_id *id,
 			       const struct ib_cm_req_event_param *param,
-			       struct rv_req_priv_data *priv_data)
+			       struct rv_req_priv_data *req_priv)
 {
-	if (priv_data->magic != RV_PRIVATE_DATA_MAGIC) {
+	if (req_priv->magic != RV_PRIVATE_DATA_MAGIC) {
 		rv_cm_err(id,
 			  "Inval CM REQ recv: magic 0x%llx expected 0x%llx\n",
-			  priv_data->magic, RV_PRIVATE_DATA_MAGIC);
+			  req_priv->magic, RV_PRIVATE_DATA_MAGIC);
 		return -EINVAL;
 	}
-	if (priv_data->ver < RV_PRIVATE_DATA_VER) {
+	if (req_priv->ver < RV_PRIVATE_DATA_VER) {
 		rv_cm_err(id,
 			  "Invalid CM REQ recv: rv version %d expected %d\n",
-			  priv_data->ver, RV_PRIVATE_DATA_VER);
+			  req_priv->ver, RV_PRIVATE_DATA_VER);
 		return -EINVAL;
 	}
 
@@ -596,10 +657,11 @@ static int rv_sconn_req_check_ah(const struct rv_sconn *sconn,
 	int ret = -EINVAL;
 
 #define RV_CHECK(f1, f2) (path->f1 != conn->ah.f2)
+#define RV_CHECK_BE32(f1, f2) (be32_to_cpu(path->f1) != conn->ah.f2)
 #define RV_REPORT(f1, f2, text, format) \
-		     rv_conn_err(sconn, "CM REQ inconsistent " text " " format \
-				 " with create_conn " format "\n", \
-				 path->f1, conn->ah.f2)
+		rv_conn_err(sconn, "CM REQ inconsistent " text " " format \
+			    " with create_conn " format "\n", \
+			    path->f1, conn->ah.f2)
 
 	if (RV_CHECK(sl, sl))
 		RV_REPORT(sl, sl, "SL", "%u");
@@ -607,7 +669,8 @@ static int rv_sconn_req_check_ah(const struct rv_sconn *sconn,
 		 RV_CHECK(traffic_class, grh.traffic_class))
 		RV_REPORT(traffic_class, grh.traffic_class, "traffic_class",
 			  "%u");
-	else if (conn->ah.is_global && RV_CHECK(flow_label, grh.flow_label))
+	else if (conn->ah.is_global &&
+		 RV_CHECK_BE32(flow_label, grh.flow_label))
 		RV_REPORT(flow_label, grh.flow_label, "flow_label", "0x%x");
 		/* for RoCE hop_limit overridden by resolver */
 	else if (conn->ah.is_global && !rv_jdev_protocol_roce(conn->jdev) &&
@@ -616,6 +679,7 @@ static int rv_sconn_req_check_ah(const struct rv_sconn *sconn,
 	else if (RV_CHECK(rate, static_rate))
 		RV_REPORT(rate, static_rate, "rate", "%u");
 #undef RV_CHECK
+#undef RV_CHECK_BE32
 #undef RV_REPORT
 	else
 		ret = 0;
@@ -649,13 +713,74 @@ static int rv_sconn_req_check_path(const struct rv_sconn *sconn,
 	else if (!rv_jdev_protocol_roce(sconn->parent->jdev) &&
 		 RV_CHECK(hop_limit))
 		RV_REPORT(hop_limit, "hop_limit", "%u");
-	else if (RV_CHECK(packet_life_time))
+	else if (path->packet_life_time < sconn->path.packet_life_time)
 		RV_REPORT(packet_life_time, "packet_life_time", "%u");
 #undef RV_CHECK
 #undef RV_REPORT
 	else
 		ret = 0;
 	return ret;
+}
+
+/*
+ * caller must hold a rv_conn reference and sconn->mutex.
+ * This func does not release the ref nor mutex
+ * The private data version must be <= version in REQ and reflect a
+ * version both client and listener support.
+ * We currently only support version 2.
+ */
+static void rv_send_rep(struct rv_sconn *sconn,
+			const struct ib_cm_req_event_param *param, u32 psn)
+{
+	struct ib_cm_rep_param rep;
+	struct rv_rep_priv_data rep_priv = {
+			.magic = RV_PRIVATE_DATA_MAGIC,
+			.ver = RV_PRIVATE_DATA_VER,
+		};
+	int ret;
+	struct rv_rej_priv_data rej_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_REJ_REASON_LOCAL_ERR,
+		.recoverable = 0,
+	};
+
+	memset(&rep, 0, sizeof(rep));
+	rep.qp_num = sconn->qp->qp_num;
+	rep.rnr_retry_count = min_t(unsigned int, 7, param->rnr_retry_count);
+	rep.flow_control = 1;
+	rep.failover_accepted = 0;
+	rep.srq = !!(sconn->qp->srq);
+	rep.responder_resources = 0;
+	rep.initiator_depth = 0;
+	rep.starting_psn = psn;
+
+	rep.private_data = &rep_priv;
+	rep.private_data_len = sizeof(rep_priv);
+
+	ret = ib_send_cm_rep(sconn->cm_id, &rep);
+	if (ret) {
+		rv_conn_err(sconn, "Failed to send CM REP: %d\n", ret);
+		goto err;
+	}
+	sconn->stats.rep_sent++;
+	trace_rv_msg_cm_req_handler(sconn, sconn->index, "Sending REP", 0,
+				    (u64)sconn);
+	rv_sconn_set_state(sconn, RV_CONNECTING, "", "", false);
+	return;
+
+err:
+	if (!ib_send_cm_rej(sconn->cm_id, IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES,
+			    NULL, 0, &rej_priv, sizeof(rej_priv))) {
+		u64 val =  (u64)IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES;
+
+		sconn->stats.rej_sent++;
+		trace_rv_msg_cm_req_handler(sconn, sconn->index,
+					    "Sending REJ reason",
+					    val, (u64)sconn);
+	}
+	rv_sconn_set_state(sconn, RV_ERROR, "local error sending REP", "",
+			   false);
 }
 
 /*
@@ -668,25 +793,31 @@ static int rv_sconn_req_check_path(const struct rv_sconn *sconn,
  *	<0 - CM should destroy the id
  * rv_find_sconn_from_req validates REQ against jdev:
  *	job key, local port, local device, sconn index,
- *	remote address (dgid or dlid), hb_interval,hb_addr, hb_rkey
+ *	remote address (dgid or dlid), hb_interval
  * For valid REQs, we establish a new IB CM handler for subsequent CM events
  */
 static int rv_cm_req_handler(struct ib_cm_id *id,
 			     const struct ib_cm_req_event_param *param,
-			     void *private_data)
+			     void *priv)
 {
-	struct ib_cm_rep_param rep;
-	struct rv_req_priv_data *priv_data =
-				 (struct rv_req_priv_data *)private_data;
+	struct rv_req_priv_data *req_priv = (struct rv_req_priv_data *)priv;
 	struct rv_sconn *sconn = NULL;
-	int ret;
 	u32 psn;
+	struct rv_rej_priv_data rej_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_REJ_REASON_LOCAL_ERR,
+		.recoverable = 0,
+	};
 
-	if (rv_check_req_basics(id, param, priv_data))
+	if (rv_check_req_basics(id, param, req_priv)) {
+		rej_priv.reason = RV_REJ_REASON_INVALID_REQ;
 		goto rej;
+	}
 
-	sconn = rv_find_sconn_from_req(id, param, priv_data);
+	sconn = rv_find_sconn_from_req(id, param, req_priv);
 	if (!sconn) {
+		rej_priv.reason = RV_REJ_REASON_NOT_FOUND;
 		rv_cm_err(id, "Could not find conn for the request\n");
 		goto rej;
 	}
@@ -700,63 +831,57 @@ static int rv_cm_req_handler(struct ib_cm_id *id,
 				   (u32)sconn->state, id,
 				   sconn->resolver_retry_left);
 
-	if (rv_sconn_req_check_ah(sconn, param->primary_path))
-		goto put_rej;
+	if (rv_sconn_req_check_ah(sconn, param->primary_path)) {
+		rej_priv.reason = RV_REJ_REASON_MISMATCH;
+		goto rej;
+	}
 	if (sconn->path.dlid &&
-	    rv_sconn_req_check_path(sconn, param->primary_path))
-		goto put_rej;
+	    rv_sconn_req_check_path(sconn, param->primary_path)) {
+		rej_priv.reason = RV_REJ_REASON_MISMATCH;
+		goto rej;
+	}
 
 	switch (sconn->state) {
 	case RV_WAITING:
 		break;
+	case RV_ERROR:
+		rej_priv.reason = RV_REJ_REASON_ERROR;
+		goto rej;
 	case RV_CONNECTING:
 	case RV_CONNECTED:
-		if (rv_sconn_can_reconn(sconn))
+		if (rv_sconn_can_reconn(sconn)) {
+			rej_priv.recoverable = 1;
+			rej_priv.reason = RV_REJ_REASON_CONNECTING;
 			rv_sconn_enter_disconnecting(sconn,
-						     "remote reconnecting");
-		/* FALLSTHROUGH */
+						     "remote reconnecting", "");
+		}
+		goto rej;
+	case RV_DISCONNECTING:
+		rej_priv.recoverable = 1;
+		rej_priv.reason = RV_REJ_REASON_DISCONNECTING;
+		goto rej;
 	default:
-		goto put_rej;
+		rej_priv.reason = RV_REJ_REASON_NOT_LISTENER;
+		goto rej;
 	}
+	if (!sconn->qp)
+		goto rej;
 
 	sconn->cm_id = id;
 	id->context = sconn;
-
-	sconn->remote_hb_addr = priv_data->hb_addr;
-	sconn->remote_hb_rkey = priv_data->hb_rkey;
 
 	id->cm_handler = rv_cm_handler;
 	if (rv_sconn_move_qp_to_rtr(sconn, &psn))
 		goto err;
 
-	/* Create cm reply */
-	memset(&rep, 0, sizeof(rep));
-	rep.qp_num = sconn->qp->qp_num;
-	rep.rnr_retry_count = min_t(unsigned int, 7, param->rnr_retry_count);
-	rep.flow_control = 1;
-	rep.failover_accepted = 0;
-	rep.srq = (sconn->qp->srq != NULL);
-	rep.responder_resources = min_t(u8, 4, param->responder_resources);
-	rep.initiator_depth = min_t(u8, 4, param->initiator_depth);
-	rep.starting_psn = psn;
-
-	/* Send the reply */
-	ret = ib_send_cm_rep(id, &rep);
-	if (ret) {
-		rv_conn_err(sconn, "Failed to send CM REP: %d\n", ret);
-		goto err;
-	}
-	sconn->stats.rep_sent++;
-	trace_rv_msg_cm_req_handler(sconn, sconn->index, "Sending REP", 0,
-				    (u64)sconn);
-	rv_sconn_set_state(sconn, RV_CONNECTING, "");
+	rv_send_rep(sconn, param, psn);
 	mutex_unlock(&sconn->mutex);
 	rv_conn_put(sconn->parent);
 	return 0;
 
 err:
 	if (!ib_send_cm_rej(id, IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES, NULL, 0,
-			    NULL, 0)) {
+			    &rej_priv, sizeof(rej_priv))) {
 		u64 val =  (u64)IB_CM_REJ_INSUFFICIENT_RESP_RESOURCES;
 
 		sconn->stats.rej_sent++;
@@ -764,22 +889,25 @@ err:
 					    "Sending REJ reason",
 					    val, (u64)sconn);
 	}
-	rv_sconn_set_state(sconn, RV_ERROR, "local error handling REQ");
+	rv_sconn_set_state(sconn, RV_ERROR, "local error handling REQ", "",
+			   false);
 	mutex_unlock(&sconn->mutex);
 	rv_conn_put(sconn->parent);
 	return 0;
 
-put_rej:
-	mutex_unlock(&sconn->mutex);
-	rv_conn_put(sconn->parent);
 rej:
-	if (!ib_send_cm_rej(id, IB_CM_REJ_CONSUMER_DEFINED, NULL, 0, NULL, 0)) {
+	if (!ib_send_cm_rej(id, IB_CM_REJ_CONSUMER_DEFINED, NULL, 0,
+			    &rej_priv, sizeof(rej_priv))) {
 		if (sconn)
 			sconn->stats.rej_sent++;
 		trace_rv_msg_cm_req_handler(sconn, sconn ? sconn->index : 0,
 					    "Sending REJ reason",
 					    (u64)IB_CM_REJ_CONSUMER_DEFINED,
 					    (u64)sconn);
+	}
+	if (sconn) {
+		mutex_unlock(&sconn->mutex);
+		rv_conn_put(sconn->parent);
 	}
 	return -EINVAL;
 }
@@ -845,13 +973,21 @@ static void rv_rq_drain_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct rv_sconn *sconn = container_of(wc->wr_cqe,
 					      struct rv_sconn, rdrain_cqe);
 
+	/*
+	 * We test RV_SCONN_DRAINING bit here only because it is possible
+	 * that this drain completion handler could come after the drain_timer
+	 * has expired. In that case, the drain timer handler and/or the
+	 * drain_work could have cleared this bit, and released the rv_conn
+	 * object. It should be reminded that other race conditions are still
+	 * possible.
+	 */
 	if (test_bit(RV_SCONN_DRAINING, &sconn->flags)) {
 		set_bit(RV_SCONN_RQ_DRAINED, &sconn->flags);
-		trace_rv_sconn_drain_done(sconn, sconn->index,
-					  sconn->qp ? sconn->qp->qp_num : 0,
-					  sconn->parent, sconn->flags,
-					  (u32)sconn->state, sconn->cm_id,
-					  sconn->resolver_retry_left);
+		trace_rv_sconn_rq_drain_done(sconn, sconn->index,
+					     sconn->qp ? sconn->qp->qp_num : 0,
+					     sconn->parent, sconn->flags,
+					     (u32)sconn->state, sconn->cm_id,
+					     sconn->resolver_retry_left);
 		if (test_bit(RV_SCONN_SQ_DRAINED, &sconn->flags)) {
 #ifdef RV_ENABLE_DRAIN_TIMEOUT
 			del_timer_sync(&sconn->drain_timer);
@@ -859,8 +995,8 @@ static void rv_rq_drain_done(struct ib_cq *cq, struct ib_wc *wc)
 			rv_queue_work(&sconn->drain_work);
 			return;
 		}
+		rv_conn_put(sconn->parent);
 	}
-	rv_conn_put(sconn->parent);
 }
 
 /* in soft IRQ context, a reference held on our behalf */
@@ -869,13 +1005,21 @@ static void rv_sq_drain_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct rv_sconn *sconn = container_of(wc->wr_cqe,
 					      struct rv_sconn, sdrain_cqe);
 
+	/*
+	 * We test RV_SCONN_DRAINING bit here only because it is possible
+	 * that this drain completion handler could come after the drain_timer
+	 * has expired. In that case, the drain timer handler and/or the
+	 * drain_work could have cleared this bit, and released the rv_conn
+	 * object. It should be reminded that other race conditions are still
+	 * possible.
+	 */
 	if (test_bit(RV_SCONN_DRAINING, &sconn->flags)) {
 		set_bit(RV_SCONN_SQ_DRAINED, &sconn->flags);
-		trace_rv_sconn_drain_done(sconn, sconn->index,
-					  sconn->qp ? sconn->qp->qp_num : 0,
-					  sconn->parent, sconn->flags,
-					  (u32)sconn->state, sconn->cm_id,
-					  sconn->resolver_retry_left);
+		trace_rv_sconn_sq_drain_done(sconn, sconn->index,
+					     sconn->qp ? sconn->qp->qp_num : 0,
+					     sconn->parent, sconn->flags,
+					     (u32)sconn->state, sconn->cm_id,
+					     sconn->resolver_retry_left);
 		if (test_bit(RV_SCONN_RQ_DRAINED, &sconn->flags)) {
 #ifdef RV_ENABLE_DRAIN_TIMEOUT
 			del_timer_sync(&sconn->drain_timer);
@@ -883,8 +1027,8 @@ static void rv_sq_drain_done(struct ib_cq *cq, struct ib_wc *wc)
 			rv_queue_work(&sconn->drain_work);
 			return;
 		}
+		rv_conn_put(sconn->parent);
 	}
-	rv_conn_put(sconn->parent);
 }
 
 #ifdef RV_ENABLE_DRAIN_TIMEOUT
@@ -907,14 +1051,14 @@ static void rv_sconn_drain_timeout_func(struct timer_list *timer)
 
 	if (!test_bit(RV_SCONN_RQ_DRAINED, &sconn->flags)) {
 		set_bit(RV_SCONN_RQ_DRAINED, &sconn->flags);
-		rv_conn_err(sconn,
+		rv_conn_dbg(sconn,
 			    "drain recv queue sconn index %u qp %u conn %p\n",
 			    sconn->index, sconn->qp ? sconn->qp->qp_num : 0,
 			    sconn->parent);
 	}
 	if (!test_bit(RV_SCONN_SQ_DRAINED, &sconn->flags)) {
 		set_bit(RV_SCONN_SQ_DRAINED, &sconn->flags);
-		rv_conn_err(sconn,
+		rv_conn_dbg(sconn,
 			    "drain send queue sconn index %u qp %u conn %p\n",
 			    sconn->index, sconn->qp ? sconn->qp->qp_num : 0,
 			    sconn->parent);
@@ -929,12 +1073,13 @@ static void rv_sconn_drain_timeout_func(struct timer_list *timer)
  * drain_lock makes sure no recv WQEs get reposted after our drain WQE
  */
 static void rv_sconn_enter_disconnecting(struct rv_sconn *sconn,
-					 const char *reason)
+					 const char *reason,
+					 const char *add_reason)
 {
 	unsigned long flags;
 	int ret;
 
-	rv_sconn_set_state(sconn, RV_DISCONNECTING, reason);
+	rv_sconn_set_state(sconn, RV_DISCONNECTING, reason, add_reason, false);
 
 	ret = rv_err_qp(sconn->qp);
 	if (ret == 1) {
@@ -959,7 +1104,7 @@ static void rv_sconn_enter_disconnecting(struct rv_sconn *sconn,
 fail:
 	trace_rv_msg_enter_disconnect(sconn, sconn->index,
 				      "Unable to move QP to error", 0, 0);
-	rv_sconn_set_state(sconn, RV_ERROR, "unable to drain QP");
+	rv_sconn_set_state(sconn, RV_ERROR, "unable to drain QP", "", false);
 }
 
 struct rv_dest_cm_work_item {
@@ -1035,7 +1180,7 @@ static void rv_sconn_done_disconnecting(struct rv_sconn *sconn)
 	}
 
 	if (test_bit(RV_SCONN_SERVER, &sconn->flags)) {
-		rv_sconn_set_state(sconn, RV_WAITING, "");
+		rv_sconn_set_state(sconn, RV_WAITING, "", "", false);
 		return;
 	}
 
@@ -1045,11 +1190,12 @@ static void rv_sconn_done_disconnecting(struct rv_sconn *sconn)
 		goto fail;
 	}
 	sconn->cm_id = id;
-	rv_sconn_set_state(sconn, RV_DELAY, "");
+	rv_sconn_set_state(sconn, RV_DELAY, "", "", false);
 	return;
 
 fail:
-	rv_sconn_set_state(sconn, RV_ERROR, "local error disconnecting");
+	rv_sconn_set_state(sconn, RV_ERROR, "local error disconnecting", "",
+			   false);
 }
 
 /* only allowed in RV_DISCONNECTING or RV_ERROR */
@@ -1068,6 +1214,131 @@ static void rv_sconn_drain_work(struct work_struct *work)
 	rv_conn_put(sconn->parent);
 }
 
+static const char * const rv_rej_reason_strs[] = {
+	[RV_REJ_REASON_NONE]		= "",
+	[RV_REJ_REASON_INVALID_REQ]	= " Invalid RV REQ",
+	[RV_REJ_REASON_INVALID_REP]	= " Invalid RV REP",
+	[RV_REJ_REASON_NOT_FOUND]	= " No Matching Conn",
+	[RV_REJ_REASON_MISMATCH]	= " Mismatched Params or Path",
+	[RV_REJ_REASON_LOCAL_ERR]	= " Remote Node Error",
+	[RV_REJ_REASON_ERROR]		= " Conn already In Error",
+	[RV_REJ_REASON_CONNECTING]	= " Preparing to Reconnect",
+	[RV_REJ_REASON_DISCONNECTING]	= " Disconnecting",
+	[RV_REJ_REASON_NOT_LISTENER]	= " Not Listener",
+	[RV_REJ_REASON_CONN_TIMEOUT]	= " Conn Timeout",
+};
+
+static const char *rv_rej_reason_str(u8 reason)
+{
+	size_t index = reason;
+
+	if (index < ARRAY_SIZE(rv_rej_reason_strs) &&
+	    rv_rej_reason_strs[index])
+		return rv_rej_reason_strs[index];
+	else
+		return " Unknown";
+}
+
+/*
+ * Check REJ private data to determine if remote side is recoverable
+ * Also returns additional RV reason text (with leading space or "")
+ * - private_data format and version
+ *	rev must always be an exact version we support
+ *	ignore rev 0 & 1, only support rev 2
+ * Assumes a REJ without additional information is not recoverable, if peer
+ * is same rev, that will be true.
+ */
+static u8 rv_rej_is_recoverable(struct rv_sconn *sconn, void *priv,
+				const char **add_reason)
+{
+	struct rv_rej_priv_data *rej_priv = (struct rv_rej_priv_data *)priv;
+
+	*add_reason = "";
+	if (!rej_priv->magic)
+		goto nopriv;
+	if (rej_priv->magic != RV_PRIVATE_DATA_MAGIC) {
+		rv_conn_err(sconn,
+			    "Inval CM REJ recv: magic 0x%llx expected 0x%llx\n",
+			    rej_priv->magic, RV_PRIVATE_DATA_MAGIC);
+		goto nopriv;
+	}
+	if (rej_priv->ver != RV_PRIVATE_DATA_VER) {
+		rv_conn_err(sconn,
+			    "Invalid CM REJ recv: rv version %d expected %d\n",
+			    rej_priv->ver, RV_PRIVATE_DATA_VER);
+		goto nopriv;
+	}
+	*add_reason = rv_rej_reason_str(rej_priv->reason);
+
+	return rej_priv->recoverable;
+
+nopriv:
+	*add_reason = rv_rej_reason_str(RV_REJ_REASON_NONE);
+	return 0;
+}
+
+static const char * const rv_dreq_reason_strs[] = {
+	[RV_DREQ_REASON_NONE]		= "",
+	[RV_DREQ_REASON_CLOSE]		= " Job Exited",
+	[RV_DREQ_REASON_RTU_UNEXP]	= " Unexpected RTU",
+	[RV_DREQ_REASON_LOCAL_ERR]	= " Remote Node Error",
+	[RV_DREQ_REASON_QP_ERR]		= " Remote QP Error",
+	[RV_DREQ_REASON_CQ_ERR]		= " Remote CQ Error",
+	[RV_DREQ_REASON_CONN_TIMEOUT]	= " Conn Timeout",
+};
+
+static const char *rv_dreq_reason_str(u8 reason)
+{
+	size_t index = reason;
+
+	if (index < ARRAY_SIZE(rv_dreq_reason_strs) &&
+	    rv_dreq_reason_strs[index])
+		return rv_dreq_reason_strs[index];
+	else
+		return " Unknown";
+}
+
+/*
+ * Check DREQ private data to determine if remote side is recoverable
+ * Also returns additional RV reason text (with leading space or "")
+ * - private_data format and version
+ *	rev must always be an exact version we support
+ *	ignore rev 0 & 1, only support rev 2
+ * Assumes a DREQ without additional information is a file close, if peer
+ * is same rev, that will be true.  Otherwise we don't attempt recovery.
+ */
+static u8 rv_dreq_is_recoverable(struct rv_sconn *sconn, void *priv,
+				 const char **add_reason, bool *is_close)
+{
+	struct rv_dreq_priv_data *dreq_priv = (struct rv_dreq_priv_data *)priv;
+
+	*add_reason = "";
+	*is_close = false;
+	if (!dreq_priv->magic)
+		goto nopriv;
+	if (dreq_priv->magic != RV_PRIVATE_DATA_MAGIC) {
+		rv_conn_err(sconn,
+			    "Inval CM DREQ recv: magic 0x%llx expected 0x%llx\n",
+			    dreq_priv->magic, RV_PRIVATE_DATA_MAGIC);
+		goto nopriv;
+	}
+	if (dreq_priv->ver != RV_PRIVATE_DATA_VER) {
+		rv_conn_err(sconn,
+			    "Invalid CM DREQ recv: rv version %d expected %d\n",
+			    dreq_priv->ver, RV_PRIVATE_DATA_VER);
+		goto nopriv;
+	}
+
+	*add_reason = rv_dreq_reason_str(dreq_priv->reason);
+	*is_close = (dreq_priv->reason == RV_DREQ_REASON_CLOSE);
+	return dreq_priv->recoverable;
+
+nopriv:
+	*add_reason = rv_dreq_reason_str(RV_DREQ_REASON_CLOSE);
+	*is_close = 1;
+	return 0;
+}
+
 /*
  * rv_cm_handler - The client Callback frunction from IB CM
  * @cm_id: Handle for connection manager
@@ -1077,6 +1348,15 @@ static void rv_sconn_drain_work(struct work_struct *work)
 static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 {
 	struct rv_sconn *sconn = id->context;
+	int recover;
+	const char *add_reason;
+	bool is_close;
+	struct rv_dreq_priv_data dreq_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_DREQ_REASON_RTU_UNEXP,
+		.recoverable = 0,
+	};
 
 	trace_rv_cm_event_handler((u32)evt->event, id, sconn);
 	if (!sconn || !sconn->parent)
@@ -1097,29 +1377,54 @@ static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 
 	switch (evt->event) {
 	case IB_CM_REP_RECEIVED:
-		rv_cm_rep_handler(sconn, evt->private_data);
+		rv_cm_rep_handler(sconn, &evt->param.rep_rcvd,
+				  evt->private_data);
 		break;
 	case IB_CM_RTU_RECEIVED:
 	case IB_CM_USER_ESTABLISHED:
 		if (sconn->state != RV_CONNECTING) {
-			if (!ib_send_cm_dreq(id, NULL, 0)) {
+			/*
+			 * QP error could be received before RTU. In that case,
+			 * the state will be set to RV_DISCONNECTING.
+			 */
+			if (sconn->state == RV_DISCONNECTING)
+				break;
+			if (!ib_send_cm_dreq(id, &dreq_priv,
+					     sizeof(dreq_priv))) {
 				sconn->stats.dreq_sent++;
 				trace_rv_msg_cm_handler(sconn, sconn->index,
 							"Sending DREQ", 0,
 							(u64)sconn);
 			}
-			rv_sconn_set_state(sconn, RV_ERROR, "unexpected RTU");
+			rv_sconn_set_state(sconn, RV_ERROR, "unexpected RTU",
+					   "", false);
 		} else if (rv_sconn_move_qp_to_rts(sconn)) {
-			if (!ib_send_cm_dreq(id, NULL, 0)) {
+			/*
+			 * If the qp has been put into ERR state due to an
+			 * invalid first data packet received from the remote
+			 * node, try to recover the connection.
+			 */
+			if (rv_query_qp_state(sconn->qp) == IB_QPS_ERR &&
+			    rv_sconn_can_reconn(sconn))
+				dreq_priv.recoverable = 1;
+			if (!ib_send_cm_dreq(id, &dreq_priv,
+					     sizeof(dreq_priv))) {
 				sconn->stats.dreq_sent++;
-				trace_rv_msg_cm_handler(sconn, sconn->index,
-							"Sending DREQ", 0,
-							(u64)sconn);
+				trace_rv_msg_cm_handler(sconn,
+							sconn->index,
+							"Sending DREQ",
+							0, (u64)sconn);
 			}
-			rv_sconn_set_state(sconn, RV_ERROR,
-					   "local error handling RTU");
+
+			if (dreq_priv.recoverable)
+				rv_sconn_enter_disconnecting(sconn, "QP in ERR",
+							     "");
+			else
+				rv_sconn_set_state(sconn, RV_ERROR,
+						   "local error handling RTU",
+						   "", false);
 		} else {
-			rv_sconn_set_state(sconn, RV_CONNECTED, "");
+			rv_sconn_set_state(sconn, RV_CONNECTED, "", "", false);
 		}
 		break;
 
@@ -1129,9 +1434,11 @@ static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 					(u64)evt->param.send_status,
 					(u64)sconn);
 		if (sconn->state == RV_CONNECTING && rv_sconn_can_reconn(sconn))
-			rv_sconn_enter_disconnecting(sconn, "no REQ response");
+			rv_sconn_enter_disconnecting(sconn, "no REQ response",
+						     "");
 		else
-			rv_sconn_set_state(sconn, RV_ERROR, "no REQ response");
+			rv_sconn_set_state(sconn, RV_ERROR, "no REQ response",
+					   "", false);
 		break;
 	case IB_CM_REP_ERROR:
 		trace_rv_msg_cm_handler(sconn, sconn->index,
@@ -1139,19 +1446,37 @@ static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 					(u64)evt->param.send_status,
 					(u64)sconn);
 		if (sconn->state == RV_CONNECTING && rv_sconn_can_reconn(sconn))
-			rv_sconn_enter_disconnecting(sconn, "no REP response");
+			rv_sconn_enter_disconnecting(sconn, "no REP response",
+						     "");
 		else
-			rv_sconn_set_state(sconn, RV_ERROR, "no REP response");
+			rv_sconn_set_state(sconn, RV_ERROR, "no REP response",
+					   "", false);
 		break;
 	case IB_CM_REJ_RECEIVED:
 		trace_rv_msg_cm_handler(sconn, sconn->index,
 					"CM REJ received reason",
 					(u64)evt->param.rej_rcvd.reason,
 					(u64)sconn);
-		if (sconn->state == RV_CONNECTING && rv_sconn_can_reconn(sconn))
-			rv_sconn_enter_disconnecting(sconn, "received REJ");
-		else
-			rv_sconn_set_state(sconn, RV_ERROR, "received REJ");
+		recover = rv_rej_is_recoverable(sconn, evt->private_data,
+						&add_reason);
+		if (sconn->state == RV_CONNECTING && recover &&
+		    rv_sconn_can_reconn(sconn)) {
+			rv_sconn_enter_disconnecting(sconn, "received REJ",
+						     add_reason);
+		} else {
+			/*
+			 * When both nodes are disconnecting, it is possible to
+			 * receive a REJ event from the ib_cm module from the
+			 * remote node when the peer's cm_id is destroyed. In
+			 * this case REJ private data is not used and no
+			 * recoverable info is communicated.
+			 */
+			if (sconn->state != RV_DISCONNECTING ||
+			    !rv_sconn_can_reconn(sconn))
+				rv_sconn_set_state(sconn, RV_ERROR,
+						   "received REJ",
+						   add_reason, false);
+		}
 		break;
 	case IB_CM_DREQ_RECEIVED:
 		if (!ib_send_cm_drep(id, NULL, 0)) {
@@ -1160,15 +1485,23 @@ static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 						"Sending DREP", 0, (u64)sconn);
 		}
 
-		if (sconn->state != RV_DISCONNECTING) {
-			if ((sconn->state == RV_CONNECTED ||
-			     sconn->state == RV_CONNECTING) &&
-			    rv_sconn_can_reconn(sconn))
+		if (sconn->state == RV_DISCONNECTING)
+			break;
+		recover = rv_dreq_is_recoverable(sconn, evt->private_data,
+						 &add_reason, &is_close);
+		if (sconn->state == RV_CONNECTED ||
+		    sconn->state == RV_CONNECTING) {
+			if (recover && rv_sconn_can_reconn(sconn))
 				rv_sconn_enter_disconnecting(sconn,
-							     "received DREQ");
+							     "received DREQ",
+							     add_reason);
 			else
 				rv_sconn_set_state(sconn, RV_ERROR,
-						   "received DREQ");
+						   "received DREQ", add_reason,
+						   is_close);
+		} else {
+			rv_sconn_set_state(sconn, RV_ERROR,
+					   "received DREQ", add_reason, false);
 		}
 		break;
 
@@ -1192,7 +1525,8 @@ static int rv_cm_handler(struct ib_cm_id *id, const struct ib_cm_event *evt)
 	default:
 		rv_conn_err(sconn, "Unhandled CM event %d\n", evt->event);
 		WARN_ON(1);
-		rv_sconn_set_state(sconn, RV_ERROR, "invalid CM event");
+		rv_sconn_set_state(sconn, RV_ERROR, "invalid CM event",
+				   "", false);
 		break;
 	}
 
@@ -1207,8 +1541,8 @@ unlock:
 /*
  * rv_cm_server_handler - The server callback function from IB CM
  * @cm_id: Handle for connection manager. This is an newly created cm_id
- *         For the new connection, which is different from the original
- *         listener cm_id.
+ *	For the new connection, which is different from the original
+ *	listener cm_id.
  * @event: The event it caught
  * It only handles incoming REQs. All other events should go to rv_cm_handler
  */
@@ -1316,6 +1650,12 @@ static void rv_cq_event_work(struct work_struct *work)
 	struct rv_cq_event_work_item *item = container_of(work,
 				struct rv_cq_event_work_item, cq_event_work);
 	struct rv_sconn *sconn = item->sconn;
+	struct rv_dreq_priv_data dreq_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_DREQ_REASON_CQ_ERR,
+		.recoverable = 0,
+	};
 
 	trace_rv_sconn_cq_event(sconn, sconn->index,
 				sconn->qp ? sconn->qp->qp_num : 0,
@@ -1330,12 +1670,13 @@ static void rv_cq_event_work(struct work_struct *work)
 
 	switch (item->event.event) {
 	case IB_EVENT_CQ_ERR:
-		if (!ib_send_cm_dreq(sconn->cm_id, NULL, 0)) {
+		if (!ib_send_cm_dreq(sconn->cm_id, &dreq_priv,
+				     sizeof(dreq_priv))) {
 			sconn->stats.dreq_sent++;
 			trace_rv_msg_cq_event(sconn, sconn->index,
 					      "Sending DREQ", 0, (u64)sconn);
 		}
-		rv_sconn_set_state(sconn, RV_ERROR, "CQ error");
+		rv_sconn_set_state(sconn, RV_ERROR, "CQ error", "", false);
 		break;
 	default:
 		break;
@@ -1386,10 +1727,6 @@ fail:
 		    "No mem for %s CQ Evt: %s: sconn index %u qp %u conn %p\n",
 		    cq_text, ib_event_msg(event->event), sconn->index,
 		    event->element.qp->qp_num, sconn->parent);
-	/*
-	 * XXX - what to do? QP WQE post will work, may get no more CQEs
-	 * CQ/rv_sconn stuck but can't get mutex here to transition sconn->state
-	 */
 	rv_conn_put(sconn->parent);
 }
 
@@ -1410,6 +1747,12 @@ static void rv_qp_event_work(struct work_struct *work)
 	struct rv_qp_event_work_item *item = container_of(work,
 				struct rv_qp_event_work_item, qp_event_work);
 	struct rv_sconn *sconn = item->sconn;
+	struct rv_dreq_priv_data dreq_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_DREQ_REASON_QP_ERR,
+		.recoverable = 0,
+	};
 
 	trace_rv_sconn_qp_event(sconn, sconn->index,
 				sconn->qp ? sconn->qp->qp_num : 0,
@@ -1433,18 +1776,24 @@ static void rv_qp_event_work(struct work_struct *work)
 	case IB_EVENT_QP_FATAL:
 	case IB_EVENT_QP_REQ_ERR:
 	case IB_EVENT_QP_ACCESS_ERR:
-		if (!ib_send_cm_dreq(sconn->cm_id, NULL, 0)) {
+		if (sconn->state == RV_DISCONNECTING ||
+		    ((sconn->state == RV_CONNECTED ||
+		      sconn->state == RV_CONNECTING) &&
+		     rv_sconn_can_reconn(sconn)))
+			dreq_priv.recoverable = 1;
+		if (!ib_send_cm_dreq(sconn->cm_id, &dreq_priv,
+				     sizeof(dreq_priv))) {
 			sconn->stats.dreq_sent++;
 			trace_rv_msg_qp_event(sconn, sconn->index,
 					      "Sending DREQ", 0, (u64)sconn);
 		}
 		if (sconn->state != RV_DISCONNECTING) {
-			if ((sconn->state == RV_CONNECTED ||
-			     sconn->state == RV_CONNECTING) &&
-			    rv_sconn_can_reconn(sconn))
-				rv_sconn_enter_disconnecting(sconn, "QP error");
+			if (dreq_priv.recoverable)
+				rv_sconn_enter_disconnecting(sconn, "QP error",
+							     "");
 			else
-				rv_sconn_set_state(sconn, RV_ERROR, "QP error");
+				rv_sconn_set_state(sconn, RV_ERROR, "QP error",
+						   "", false);
 		}
 		break;
 	default:
@@ -1489,10 +1838,6 @@ fail:
 		    "No mem for QP Event: %s: sconn index %u qp %u conn %p\n",
 		    ib_event_msg(event->event), sconn->index,
 		    event->element.qp->qp_num, sconn->parent);
-	/*
-	 * XXX - what to do? QP WQE post will work and get failed CQEs
-	 * rv_sconn stuck but can't get mutex here to transition sconn->state
-	 */
 	rv_conn_put(sconn->parent);
 }
 
@@ -1521,8 +1866,8 @@ static int rv_create_qp(int rv_inx, struct rv_sconn *sconn,
 	qp_depth = jdev->qp_depth + 3;
 
 	if (!sconn->send_cq) {
-		sconn->send_cq = ib_alloc_cq(jdev->dev->ib_dev, sconn,
-					     qp_depth, 0, IB_POLL_SOFTIRQ);
+		sconn->send_cq = ib_alloc_cq_any(jdev->dev->ib_dev, sconn,
+						 qp_depth, IB_POLL_SOFTIRQ);
 		if (IS_ERR(sconn->send_cq)) {
 			ret = PTR_ERR(sconn->send_cq);
 			rv_err(rv_inx, "Creating send cq failed %d\n", ret);
@@ -1533,8 +1878,8 @@ static int rv_create_qp(int rv_inx, struct rv_sconn *sconn,
 	}
 
 	if (!sconn->recv_cq) {
-		sconn->recv_cq = ib_alloc_cq(jdev->dev->ib_dev, sconn,
-					     qp_depth, 0, IB_POLL_SOFTIRQ);
+		sconn->recv_cq = ib_alloc_cq_any(jdev->dev->ib_dev, sconn,
+						 qp_depth, IB_POLL_SOFTIRQ);
 		if (IS_ERR(sconn->recv_cq)) {
 			ret = PTR_ERR(sconn->recv_cq);
 			rv_err(rv_inx, "Creating recv cq failed %d\n", ret);
@@ -1591,6 +1936,7 @@ bail_out:
 	return ret;
 }
 
+#ifndef USE_IB_DRAIN
 struct rv_drain_cqe {
 	struct ib_cqe cqe;
 	struct completion done;
@@ -1603,21 +1949,13 @@ static void rv_drain_qp_done(struct ib_cq *cq, struct ib_wc *wc)
 
 	complete(&cqe->done);
 }
+#endif
 
-/*
- * Check if the qp is in error state. If not, put it into error state.
- *
- * Return:  0  - Success;
- *          1 - QP in RESET
- *          Other - Failure.
- * ERR->ERR transition can fail, could have raced with async event
- * so check state again if ib_modify_qp fails
- */
-static int rv_err_qp(struct ib_qp *qp)
+int rv_query_qp_state(struct ib_qp *qp)
 {
 	struct ib_qp_attr attr;
 	struct ib_qp_init_attr qp_init_attr;
-	int ret, ret2;
+	int ret;
 
 	ret = ib_query_qp(qp, &attr, IB_QP_STATE, &qp_init_attr);
 	if (ret) {
@@ -1625,17 +1963,48 @@ static int rv_err_qp(struct ib_qp *qp)
 		       qp->qp_num, ret);
 		return ret;
 	}
-	trace_rv_msg_err_qp(RV_INVALID, "qp_state", (u64)qp->qp_num,
-			    (u64)attr.qp_state);
+	trace_rv_conn_msg_query_qp_state(RV_INVALID, "qp_state",
+					 (u64)qp->qp_num,
+					 (u64)attr.qp_state);
 
-	if (attr.qp_state == IB_QPS_RESET)
+	return attr.qp_state;
+}
+
+/*
+ * If QP is not in reset state, move it to error state.
+ *
+ * Return:  0  - Success;
+ *	    1 - QP in RESET
+ *	    <0 - Failure.
+ */
+#ifdef NO_ERR_TO_ERR
+/*
+ * ERR->ERR transition can fail, could have raced with async event
+ * so check state again if ib_modify_qp fails
+ */
+#endif
+static int rv_err_qp(struct ib_qp *qp)
+{
+	struct ib_qp_attr attr;
+	int ret;
+#ifdef NO_ERR_TO_ERR
+	struct ib_qp_init_attr qp_init_attr;
+	int ret2;
+#endif
+
+	ret = rv_query_qp_state(qp);
+	if (ret < 0)
+		return ret;
+
+	if (ret == IB_QPS_RESET)
 		return 1;
 
-	if (attr.qp_state == IB_QPS_ERR)
+	if (ret == IB_QPS_ERR)
 		return 0;
 
 	attr.qp_state = IB_QPS_ERR;
 	ret = ib_modify_qp(qp, &attr, IB_QP_STATE);
+#ifdef NO_ERR_TO_ERR
 	if (!ret)
 		return ret;
 
@@ -1646,10 +2015,12 @@ static int rv_err_qp(struct ib_qp *qp)
 	rv_err(RV_INVALID,
 	       "failed to put qp %u into error state: %d now in 0x%x\n",
 	       qp->qp_num, ret, attr.qp_state);
+#endif
 
 	return ret;
 }
 
+#ifndef USE_IB_DRAIN
 /* Post a WR and block until its completion is reaped for the SQ.*/
 static void rv_drain_sq(struct ib_qp *qp)
 {
@@ -1682,7 +2053,7 @@ static void rv_drain_sq(struct ib_qp *qp)
 	}
 
 	if (!wait_for_completion_timeout(&sdrain->done, DRAIN_TIMEOUT * HZ))
-		rv_err(RV_INVALID, "timeout to drain send queue qp %u\n",
+		rv_dbg(RV_INVALID, "timeout to drain send queue qp %u\n",
 		       qp->qp_num);
 		/* XXX leak instead of leaving future CQE cb hazzard */
 	else
@@ -1716,7 +2087,7 @@ static void rv_drain_rq(struct ib_qp *qp)
 	}
 
 	if (!wait_for_completion_timeout(&rdrain->done, DRAIN_TIMEOUT * HZ))
-		rv_err(RV_INVALID, "timeout to drain recv queue qp %u\n",
+		rv_dbg(RV_INVALID, "timeout to drain recv queue qp %u\n",
 		       qp->qp_num);
 		/* XXX leak instead of leaving future CQE cb hazzard */
 	else
@@ -1730,6 +2101,7 @@ static void rv_drain_qp(struct ib_qp *qp)
 	if (!qp->srq)
 		rv_drain_rq(qp);
 }
+#endif /* USE_IB_DRAIN */
 
 #ifdef DRAIN_WQ
 struct rv_dest_qp_work_item {
@@ -1739,6 +2111,7 @@ struct rv_dest_qp_work_item {
 	struct ib_cq *recv_cq;
 };
 
+/* only used if QP needs to be drained */
 static void rv_handle_destroy_qp(struct work_struct *work)
 {
 	struct rv_dest_qp_work_item *item = container_of(work,
@@ -1747,7 +2120,11 @@ static void rv_handle_destroy_qp(struct work_struct *work)
 	trace_rv_msg_destroy_qp(NULL, RV_INVALID, "destroy qp",
 				item->qp ? (u64)item->qp->qp_num : 0, 0);
 	if (item->qp) {
+#ifdef USE_IB_DRAIN
+		ib_drain_qp(item->qp);
+#else
 		rv_drain_qp(item->qp);
+#endif
 		ib_destroy_qp(item->qp);
 	}
 	if (item->recv_cq)
@@ -1762,36 +2139,48 @@ static void rv_handle_destroy_qp(struct work_struct *work)
 /*
  * destroy QP and CQs, cannot hold sconn->mutex
  * Drain the qp before destroying it to avoid the race between QP destroy
- * and completion handler. In the event of a CQ Error, the drain may timeout so
- * we can't use ib_drain_qp
+ * and completion handler. Timeout protects against CQ issues.
  */
 static void rv_destroy_qp(struct rv_sconn *sconn)
 {
+	int qps = -1;
 #ifdef DRAIN_WQ
 	struct rv_dest_qp_work_item *item;
+#endif
 
-	item = kzalloc(sizeof(*item), GFP_KERNEL);
-	if (item) {
-		trace_rv_msg_destroy_qp(sconn, sconn->index, "queue destroy qp",
-				sconn->qp ? (u64)sconn->qp->qp_num : 0,
-				(u64)sconn);
-		INIT_WORK(&item->destroy_work, rv_handle_destroy_qp);
-		item->qp = sconn->qp;
-		item->recv_cq = sconn->recv_cq;
-		item->send_cq = sconn->send_cq;
-		sconn->qp = NULL;
-		sconn->recv_cq = NULL;
-		sconn->send_cq = NULL;
+	if (sconn->qp)
+		qps = rv_query_qp_state(sconn->qp);
+#ifdef DRAIN_WQ
+	if (qps >= 0 && qps != IB_QPS_RESET) {
+		item = kzalloc(sizeof(*item), GFP_KERNEL);
+		if (item) {
+			trace_rv_msg_destroy_qp(sconn, sconn->index,
+						"queue destroy qp",
+						(u64)sconn->qp->qp_num,
+						(u64)sconn);
+			INIT_WORK(&item->destroy_work, rv_handle_destroy_qp);
+			item->qp = sconn->qp;
+			item->recv_cq = sconn->recv_cq;
+			item->send_cq = sconn->send_cq;
+			sconn->qp = NULL;
+			sconn->recv_cq = NULL;
+			sconn->send_cq = NULL;
 
-		rv_queue_work2(&item->destroy_work);
-		return;
+			rv_queue_work2(&item->destroy_work);
+			return;
+		}
 	}
 #endif
 	trace_rv_msg_destroy_qp(sconn, sconn->index, "destroy qp",
 				sconn->qp ? (u64)sconn->qp->qp_num : 0,
 				(u64)sconn);
 	if (sconn->qp) {
-		rv_drain_qp(sconn->qp);
+		if (qps >= 0 && qps != IB_QPS_RESET)
+#ifdef USE_IB_DRAIN
+			ib_drain_qp(sconn->qp);
+#else
+			rv_drain_qp(sconn->qp);
+#endif
 		ib_destroy_qp(sconn->qp);
 		sconn->qp = NULL;
 	}
@@ -1851,7 +2240,9 @@ static int rv_sconn_init(struct rv_user *rv, struct rv_sconn *sconn,
 	sconn->sdrain_cqe.done = rv_sq_drain_done;
 	sconn->hb_cqe.done = rv_hb_done;
 
-	if (jdev->loc_addr < param->rem_addr)
+	if (param->ah.is_global ?
+	    memcmp(jdev->loc_gid, param->ah.grh.dgid, sizeof(jdev->loc_gid)) < 0
+	    : jdev->loc_addr < param->rem_addr)
 		set_bit(RV_SCONN_SERVER, &sconn->flags);
 
 	ret = rv_create_qp(rv->inx, sconn, jdev);
@@ -1866,7 +2257,8 @@ static int rv_sconn_init(struct rv_user *rv, struct rv_sconn *sconn,
 							       jdev->service_id,
 							  rv_cm_server_handler);
 			if (!jdev->listener) {
-				rv_err(rv->inx, "Failed to add listener\n");
+				rv_err(rv->inx,
+				       "Failed to get/allocate listener\n");
 				goto bail_qp;
 			}
 		}
@@ -1939,8 +2331,8 @@ static struct rv_conn *rv_conn_alloc(struct rv_user *rv,
 	}
 	trace_rv_conn_alloc(conn, conn->rem_addr, conn->ah.is_global,
 			    conn->ah.dlid,
-			    be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[0])),
-			    be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[8])),
+			    be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[0])),
+			    be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[8])),
 			    conn->num_conn, conn->next,
 			    conn->jdev, kref_read(&conn->kref));
 
@@ -1988,17 +2380,23 @@ done:
 static int rv_jdev_check_create_ah(int rv_inx, const struct rv_job_dev *jdev,
 				   const struct rv_conn_create_params_in *param)
 {
+	if (!param->ah.dlid && !rv_jdev_protocol_roce(jdev)) {
+		rv_err(rv_inx, "create_conn: DLID must be non-zero\n");
+		return -EINVAL;
+	}
 	if (param->ah.is_global &&
 	    jdev->loc_gid_index != param->ah.grh.sgid_index) {
-		rv_err(rv_inx, "create_conn incorrect sgid_index\n");
+		rv_err(rv_inx, "create_conn: incorrect sgid_index\n");
 		return -EINVAL;
 	}
 	if (jdev->port_num != param->ah.port_num) {
-		rv_err(rv_inx, "create_conn port or sgid_index\n");
+		rv_err(rv_inx, "create_conn: port or sgid_index\n");
 		return -EINVAL;
 	}
-	if (jdev->loc_addr == param->rem_addr) {
-		rv_err(rv_inx, "Loopback connections not allowed\n");
+	if (param->ah.is_global ?
+	    !memcmp(jdev->loc_gid, param->ah.grh.dgid, sizeof(jdev->loc_gid))
+	    : jdev->loc_addr == param->rem_addr) {
+		rv_err(rv_inx, "create_conn: loopback not allowed\n");
 		return -EINVAL;
 	}
 	return 0;
@@ -2017,7 +2415,7 @@ static int rv_conn_create_check_ah(int rv_inx, const struct rv_conn *conn,
 
 #define RV_CHECK(field) (ah->field != conn->ah.field)
 #define RV_REPORT(field, text, format) \
-		     rv_err(rv_inx, "create_conn inconsistent " text " " \
+		     rv_err(rv_inx, "create_conn: inconsistent " text " " \
 			    format " with other processes " format "\n", \
 			    ah->field, conn->ah.field)
 	if (RV_CHECK(dlid))
@@ -2056,17 +2454,12 @@ int doit_conn_create(struct rv_user *rv, unsigned long arg)
 		param.in.rem_addr, param.in.ah.is_global,
 		param.in.ah.grh.sgid_index, param.in.ah.port_num,
 		param.in.ah.dlid,
-		be64_to_cpu(*((u64 *)&param.in.ah.grh.dgid[0])),
-		be64_to_cpu(*((u64 *)&param.in.ah.grh.dgid[8])));
-
-	if (!param.in.ah.dlid) {
-		rv_err(rv->inx, "DLID must be non-zero for connections\n");
-		return -EINVAL;
-	}
+		be64_to_cpu(*((__be64 *)&param.in.ah.grh.dgid[0])),
+		be64_to_cpu(*((__be64 *)&param.in.ah.grh.dgid[8])));
 
 	mutex_lock(&rv->mutex);
-	if (!rv->attached) {
-		ret = rv->was_attached ? -ENXIO : -EINVAL;
+	if (rv->state != RV_USER_ATTACHED) {
+		ret = (rv->state == RV_USER_WAS_ATTACHED) ? -ENXIO : -EINVAL;
 		goto bail_unlock;
 	}
 	if (rv->rdma_mode != RV_RDMA_MODE_KERNEL) {
@@ -2101,8 +2494,8 @@ int doit_conn_create(struct rv_user *rv, unsigned long arg)
 	}
 	trace_rv_conn_create(conn, conn->rem_addr, conn->ah.is_global,
 			     conn->ah.dlid,
-			     be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[0])),
-			     be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[8])),
+			     be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[0])),
+			     be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[8])),
 			     conn->num_conn, conn->next,
 			     conn->jdev, kref_read(&conn->kref));
 	ret = rv_conn_create_check_ah(rv->inx, conn, &param.in.ah);
@@ -2196,7 +2589,7 @@ retry:
 		}
 	}
 	if (rv_sconn_can_reconn(sconn))
-		rv_sconn_set_state(sconn, RV_DELAY, "");
+		rv_sconn_set_state(sconn, RV_DELAY, "", "", false);
 fail:
 	if (test_bit(RV_SCONN_WAS_CONNECTED, &sconn->flags))
 		sconn->stats.reresolve_fail++;
@@ -2205,7 +2598,7 @@ fail:
 	rv_sconn_free_primary_path(sconn);
 	if (sconn->state != RV_DELAY)
 		rv_sconn_set_state(sconn, RV_ERROR,
-				   "unable to resolve address");
+				   "unable to resolve address", "", false);
 	mutex_unlock(&sconn->mutex);
 	rv_conn_put(sconn->parent);
 }
@@ -2227,8 +2620,14 @@ static int rv_resolve_ip(struct rv_sconn *sconn)
 		sconn->stats.reresolve++;
 	else
 		sconn->stats.resolve++;
-	rdma_gid2ip(&src_addr._sockaddr, &sconn->primary_path->sgid);
-	rdma_gid2ip(&dst_addr._sockaddr, &sconn->primary_path->dgid);
+	/*
+	 * To avoid a upstream compiling warning by using the
+	 * largest field in a union.
+	 */
+	rdma_gid2ip((struct sockaddr *)&src_addr._sockaddr_in6,
+		    &sconn->primary_path->sgid);
+	rdma_gid2ip((struct sockaddr *)&dst_addr._sockaddr_in6,
+		    &sconn->primary_path->dgid);
 
 	if (src_addr._sockaddr.sa_family != dst_addr._sockaddr.sa_family)
 		return -EINVAL;
@@ -2254,7 +2653,7 @@ static void rv_resolve_path(struct rv_sconn *sconn)
 	int ret;
 	struct rv_job_dev *jdev = sconn->parent->jdev;
 
-	rv_sconn_set_state(sconn, RV_RESOLVING, "");
+	rv_sconn_set_state(sconn, RV_RESOLVING, "", "", false);
 
 	sconn->resolver_retry_left = RV_RESOLVER_RETRY;
 
@@ -2288,7 +2687,8 @@ err:
 	else
 		sconn->stats.resolve_fail++;
 	rv_sconn_free_primary_path(sconn);
-	rv_sconn_set_state(sconn, RV_ERROR, "local error resolving address");
+	rv_sconn_set_state(sconn, RV_ERROR, "local error resolving address",
+			   "", false);
 }
 
 /* caller must hold a rv_conn reference. This func does not release that ref */
@@ -2296,7 +2696,7 @@ static void rv_send_req(struct rv_sconn *sconn)
 {
 	struct rv_job_dev *jdev = sconn->parent->jdev;
 	struct ib_cm_req_param req;
-	struct rv_req_priv_data priv_data = {
+	struct rv_req_priv_data req_priv = {
 			.magic = RV_PRIVATE_DATA_MAGIC,
 			.ver = RV_PRIVATE_DATA_VER,
 		};
@@ -2306,32 +2706,29 @@ static void rv_send_req(struct rv_sconn *sconn)
 	req.ppath_sgid_attr = jdev->sgid_attr;
 	req.flow_control = 1;
 	req.retry_count = 7;
-	req.responder_resources = 4;
+	req.responder_resources = 0;
 	req.rnr_retry_count = 7;
 	req.max_cm_retries = 15;
 	req.primary_path = sconn->primary_path;
 	req.service_id = req.primary_path->service_id;
-	req.initiator_depth = 4;
+	req.initiator_depth = 0;
 	req.remote_cm_response_timeout = 17;
 	req.local_cm_response_timeout = 17;
 	req.qp_num = sconn->qp->qp_num;
 	req.qp_type = sconn->qp->qp_type;
-	req.srq = (sconn->qp->srq != NULL);
-	req.starting_psn = prandom_u32() & 0xffffff;
-
-	req.private_data = &priv_data;
-	req.private_data_len = sizeof(priv_data);
-	priv_data.index = sconn->index;
-	priv_data.job_key_len = jdev->job_key_len;
-	memcpy(priv_data.job_key, jdev->job_key, sizeof(priv_data.job_key));
-#ifdef RV_HB_RDMA
-	priv_data.hb_addr = TBD;
-	priv_data.hb_rkey = jdev->hb_mr->rkey;
+	req.srq = !!(sconn->qp->srq);
+#ifdef NO_GET_RANDOM_U32
+	req.starting_psn = get_random_int() & 0xffffff;
 #else
-	priv_data.hb_addr = 0;
-	priv_data.hb_rkey = 0;
+	req.starting_psn = get_random_u32() & 0xffffff;
 #endif
-	priv_data.uid = jdev->uid;
+
+	req.private_data = &req_priv;
+	req.private_data_len = sizeof(req_priv);
+	req_priv.index = sconn->index;
+	req_priv.job_key_len = jdev->job_key_len;
+	memcpy(req_priv.job_key, jdev->job_key, sizeof(req_priv.job_key));
+	req_priv.uid = jdev->uid;
 	trace_rv_msg_send_req(sconn, sconn->index,
 			      "sending rec_type | route_resolved, dmac",
 			      (u64)(req.primary_path->rec_type |
@@ -2350,10 +2747,11 @@ static void rv_send_req(struct rv_sconn *sconn)
 		sconn->stats.req_sent++;
 		trace_rv_msg_send_req(sconn, sconn->index, "Sending REQ", 0,
 				      (u64)sconn);
-		rv_sconn_set_state(sconn, RV_CONNECTING, "");
+		rv_sconn_set_state(sconn, RV_CONNECTING, "", "", false);
 	} else {
 		rv_conn_err(sconn, "Failed to send cm req. %d\n", ret);
-		rv_sconn_set_state(sconn, RV_ERROR, "local error sending REQ");
+		rv_sconn_set_state(sconn, RV_ERROR, "local error sending REQ",
+				   "", false);
 	}
 }
 
@@ -2369,6 +2767,18 @@ static void rv_sconn_timeout_work(struct work_struct *work)
 {
 	struct rv_sconn *sconn = container_of(work, struct rv_sconn,
 					      timer_work);
+	struct rv_rej_priv_data rej_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_REJ_REASON_CONN_TIMEOUT,
+		.recoverable = 0,
+	};
+	struct rv_dreq_priv_data dreq_priv = {
+		.magic = RV_PRIVATE_DATA_MAGIC,
+		.ver = RV_PRIVATE_DATA_VER,
+		.reason = RV_DREQ_REASON_CONN_TIMEOUT,
+		.recoverable = 0,
+	};
 
 	mutex_lock(&sconn->mutex);
 	trace_rv_sconn_timeout_work(sconn, sconn->index,
@@ -2380,28 +2790,31 @@ static void rv_sconn_timeout_work(struct work_struct *work)
 	case RV_RESOLVING:
 		rv_sconn_free_primary_path(sconn);
 		rdma_addr_cancel(&sconn->dev_addr);
-		rv_sconn_set_state(sconn, RV_ERROR, "connection timeout");
+		rv_sconn_set_state(sconn, RV_ERROR, "connection timeout", "",
+				   false);
 		break;
 	case RV_CONNECTING:
 		if (!ib_send_cm_rej(sconn->cm_id, IB_CM_REJ_TIMEOUT, NULL, 0,
-				    NULL, 0)) {
+				    &rej_priv, sizeof(rej_priv))) {
 			sconn->stats.rej_sent++;
 			trace_rv_msg_sconn_timeout_work(sconn, sconn->index,
 							"Sending REJ reason",
 							(u64)IB_CM_REJ_TIMEOUT,
 							(u64)sconn);
 		}
-		if (!ib_send_cm_dreq(sconn->cm_id, NULL, 0)) {
+		if (!ib_send_cm_dreq(sconn->cm_id, &dreq_priv,
+				     sizeof(dreq_priv))) {
 			sconn->stats.dreq_sent++;
 			trace_rv_msg_sconn_timeout_work(sconn, sconn->index,
 							"Sending DREQ", 0,
 							(u64)sconn);
 		}
-		/* FALLSTHROUGH */
+		fallthrough;
 	case RV_WAITING:
 	case RV_DISCONNECTING:
 	case RV_DELAY:
-		rv_sconn_set_state(sconn, RV_ERROR, "connection timeout");
+		rv_sconn_set_state(sconn, RV_ERROR, "connection timeout", "",
+				   false);
 		break;
 	case RV_CONNECTED:
 		break;
@@ -2472,7 +2885,7 @@ static int rv_sconn_connect_check_path(int rv_inx, const struct rv_sconn *sconn,
 
 #define RV_CHECK(field) (path->field != sconn->path.field)
 #define RV_REPORT(field, text, format) \
-		     rv_err(rv_inx, "connect inconsistent " text " " format \
+		     rv_err(rv_inx, "connect: inconsistent " text " " format \
 			    " with other processes " format "\n", \
 			    path->field, sconn->path.field)
 
@@ -2480,14 +2893,14 @@ static int rv_sconn_connect_check_path(int rv_inx, const struct rv_sconn *sconn,
 		RV_REPORT(dlid, "DLID", "0x%x");
 	else if (cmp_gid(path->dgid, sconn->path.dgid))
 		rv_err(rv_inx,
-		       "inconsistent dest %s with other proc %s\n",
+		       "connect: inconsistent dest %s with other proc %s\n",
 		       show_gid(buf1, sizeof(buf1), path->dgid),
 		       show_gid(buf2, sizeof(buf2), sconn->path.dgid));
 	else if (RV_CHECK(slid))
 		RV_REPORT(slid, "SLID", "0x%x");
 	else if (cmp_gid(path->sgid, sconn->path.sgid))
 		rv_err(rv_inx,
-		       "inconsistent src %s with other processes %s\n",
+		       "connect: inconsistent src %s with other processes %s\n",
 		       show_gid(buf1, sizeof(buf1), path->sgid),
 		       show_gid(buf2, sizeof(buf2), sconn->path.sgid));
 	else if (RV_CHECK(pkey))
@@ -2544,7 +2957,8 @@ static int rv_sconn_connect(int rv_inx, struct rv_sconn *sconn,
 	if (IS_ERR(id)) {
 		rv_err(rv_inx, "Create CM ID failed\n");
 		rv_sconn_set_state(sconn, RV_ERROR,
-				   "local error preparing client");
+				   "local error preparing client", "", false);
+		mutex_unlock(&sconn->mutex);
 		return PTR_ERR(id);
 	}
 	sconn->cm_id = id;
@@ -2566,17 +2980,19 @@ static int rv_conn_connect_check_ah(int rv_inx, const struct rv_conn *conn,
 	int ret = -EINVAL;
 
 #define RV_CHECK(f1, f2) (path->f1 != conn->ah.f2)
+#define RV_CHECK_BE32(f1, f2) (be32_to_cpu(path->f1) != conn->ah.f2)
 #define RV_REPORT(f1, f2, text, format) \
-		     rv_err(rv_inx, "connect inconsistent " text " " \
+		     rv_err(rv_inx, "connect: inconsistent " text " " \
 			    format " with create_conn " format "\n", \
 			    path->f1, conn->ah.f2)
 	if (be16_to_cpu(path->dlid) != conn->ah.dlid)
 		rv_err(rv_inx,
-		       "connect inconsistent DLID 0x%x with create_conn 0x%x\n",
+		       "connect: inconsistent DLID 0x%x with create_conn 0x%x\n",
 		       be16_to_cpu(path->dlid), conn->ah.dlid);
 	else if (conn->ah.is_global &&
 		 cmp_gid(conn->ah.grh.dgid, path->dgid))
-		rv_err(rv_inx, "inconsistent dest %s with other proc %s\n",
+		rv_err(rv_inx,
+		       "connect: inconsistent dest %s with other proc %s\n",
 		       show_gid(buf1, sizeof(buf1), path->dgid),
 		       show_gid(buf2, sizeof(buf2), conn->ah.grh.dgid));
 	else if (RV_CHECK(sl, sl))
@@ -2585,7 +3001,8 @@ static int rv_conn_connect_check_ah(int rv_inx, const struct rv_conn *conn,
 		 RV_CHECK(traffic_class, grh.traffic_class))
 		RV_REPORT(traffic_class, grh.traffic_class, "traffic_class",
 			  "%u");
-	else if (conn->ah.is_global && RV_CHECK(flow_label, grh.flow_label))
+	else if (conn->ah.is_global &&
+		 RV_CHECK_BE32(flow_label, grh.flow_label))
 		RV_REPORT(flow_label, grh.flow_label, "flow_label", "0x%x");
 	else if (conn->ah.is_global && RV_CHECK(hop_limit, grh.hop_limit))
 		RV_REPORT(hop_limit, grh.hop_limit, "hop_limit", "%u");
@@ -2594,20 +3011,21 @@ static int rv_conn_connect_check_ah(int rv_inx, const struct rv_conn *conn,
 	else
 		ret = 0;
 #undef RV_CHECK
+#undef RV_CHECK_BE32
 #undef RV_REPORT
 	return ret;
 }
 
-int rv_conn_connect(int rv_inx, struct rv_conn *conn,
-		    struct rv_conn_connect_params_in *params)
+static int rv_conn_connect(int rv_inx, struct rv_conn *conn,
+			   struct rv_conn_connect_params_in *params)
 {
 	int i;
 	int ret;
 
 	trace_rv_conn_connect(conn, conn->rem_addr, conn->ah.is_global,
 			      conn->ah.dlid,
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[0])),
-			      be64_to_cpu(*((u64 *)&conn->ah.grh.dgid[8])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[0])),
+			      be64_to_cpu(*((__be64 *)&conn->ah.grh.dgid[8])),
 			      conn->num_conn, conn->next,
 			      conn->jdev, kref_read(&conn->kref));
 
@@ -2631,7 +3049,7 @@ static int rv_jdev_check_connect_path(int rv_inx, const struct rv_job_dev *jdev,
 	char buf2[RV_MAX_ADDR_STR];
 
 	if (cmp_gid(path->sgid, jdev->loc_gid)) {
-		rv_err(rv_inx, "connect inconsistent src %s with attach %s\n",
+		rv_err(rv_inx, "connect: inconsistent src %s with attach %s\n",
 		       show_gid(buf1, sizeof(buf1), path->sgid),
 		       show_gid(buf2, sizeof(buf2), jdev->loc_gid));
 		return -EINVAL;
@@ -2653,8 +3071,8 @@ int doit_conn_connect(struct rv_user *rv, unsigned long arg)
 		return -EFAULT;
 
 	mutex_lock(&rv->mutex);
-	if (!rv->attached) {
-		ret = rv->was_attached ? -ENXIO : -EINVAL;
+	if (rv->state != RV_USER_ATTACHED) {
+		ret = (rv->state == RV_USER_WAS_ATTACHED) ? -ENXIO : -EINVAL;
 		goto unlock;
 	}
 	if (rv->rdma_mode != RV_RDMA_MODE_KERNEL) {
@@ -2666,7 +3084,7 @@ int doit_conn_connect(struct rv_user *rv, unsigned long arg)
 		goto unlock;
 	conn = user_conn_find(rv, params.handle);
 	if (!conn) {
-		rv_err(rv->inx, "No connection found\n");
+		rv_err(rv->inx, "connect: No connection found\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -2696,7 +3114,7 @@ int doit_conn_connected(struct rv_user *rv, unsigned long arg)
 	mutex_lock(&rv->mutex);
 	conn = user_conn_find(rv, params.handle);
 	if (!conn) {
-		rv_err(rv->inx, "No connection found\n");
+		rv_err(rv->inx, "connect: No connection found\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
@@ -2714,13 +3132,14 @@ int doit_conn_get_conn_count(struct rv_user *rv, unsigned long arg)
 	struct rv_conn *conn;
 	struct rv_sconn *sconn;
 	int ret = 0;
+	u8 index;
 
-	if (copy_from_user(&params, (void __user *)arg, sizeof(params)))
+	if (copy_from_user(&params.in, (void __user *)arg, sizeof(params.in)))
 		return -EFAULT;
 
 	mutex_lock(&rv->mutex);
-	if (!rv->attached) {
-		ret = rv->was_attached ? -ENXIO : -EINVAL;
+	if (rv->state != RV_USER_ATTACHED) {
+		ret = (rv->state == RV_USER_WAS_ATTACHED) ? -ENXIO : -EINVAL;
 		goto unlock;
 	}
 	if (rv->rdma_mode != RV_RDMA_MODE_KERNEL) {
@@ -2730,17 +3149,19 @@ int doit_conn_get_conn_count(struct rv_user *rv, unsigned long arg)
 
 	conn = user_conn_find(rv, params.in.handle);
 	if (!conn) {
-		rv_err(rv->inx, "No connection found\n");
+		rv_err(rv->inx, "get_conn_count: No connection found\n");
 		ret = -EINVAL;
 		goto unlock;
 	}
 	if (params.in.index >= conn->num_conn) {
-		rv_err(rv->inx, "Invalid index: %d\n", params.in.index);
+		rv_err(rv->inx, "get_conn_count: Invalid index: %d\n",
+		       params.in.index);
 		ret = -EINVAL;
 		goto unlock;
 	}
+	index = array_index_nospec(params.in.index, conn->num_conn);
 
-	sconn = &conn->sconn_arr[params.in.index];
+	sconn = &conn->sconn_arr[index];
 
 	mutex_lock(&sconn->mutex);
 	if (sconn->state == RV_ERROR)
@@ -2753,7 +3174,7 @@ int doit_conn_get_conn_count(struct rv_user *rv, unsigned long arg)
 	if (ret)
 		goto unlock;
 
-	if (copy_to_user((void __user *)arg, &params, sizeof(params)))
+	if (copy_to_user((void __user *)arg, &params.out, sizeof(params.out)))
 		ret = -EFAULT;
 unlock:
 	mutex_unlock(&rv->mutex);
@@ -2850,8 +3271,8 @@ static void rv_sconn_add_stats(struct rv_sconn *sconn,
 }
 
 /* add up all the stats for sconns in given conn */
-void rv_conn_add_stats(struct rv_conn *conn,
-		       struct rv_conn_get_stats_params *params)
+static void rv_conn_add_stats(struct rv_conn *conn,
+			      struct rv_conn_get_stats_params *params)
 {
 	int i;
 
@@ -2870,8 +3291,8 @@ int doit_conn_get_stats(struct rv_user *rv, unsigned long arg)
 		return -EFAULT;
 
 	mutex_lock(&rv->mutex);
-	if (!rv->attached) {
-		ret = rv->was_attached ? -ENXIO : -EINVAL;
+	if (rv->state != RV_USER_ATTACHED) {
+		ret = (rv->state == RV_USER_WAS_ATTACHED) ? -ENXIO : -EINVAL;
 		goto unlock;
 	}
 	if (rv->rdma_mode != RV_RDMA_MODE_KERNEL) {
@@ -2882,7 +3303,8 @@ int doit_conn_get_stats(struct rv_user *rv, unsigned long arg)
 	if (params.in.handle) {
 		conn = user_conn_find(rv, params.in.handle);
 		if (!conn) {
-			rv_err(rv->inx, "No connection found\n");
+			rv_err(rv->inx,
+			       "conn_get_stats: No connection found\n");
 			ret = -EINVAL;
 			goto unlock;
 		}
@@ -2898,6 +3320,7 @@ int doit_conn_get_stats(struct rv_user *rv, unsigned long arg)
 			ret = -EINVAL;
 			goto unlock;
 		} else {
+			index = array_index_nospec(index, conn->num_conn);
 			rv_sconn_add_stats(&conn->sconn_arr[index], &params);
 		}
 	} else {
@@ -2911,7 +3334,7 @@ int doit_conn_get_stats(struct rv_user *rv, unsigned long arg)
 			rv_conn_add_stats(conn, &params);
 	}
 
-	if (copy_to_user((void __user *)arg, &params, sizeof(params)))
+	if (copy_to_user((void __user *)arg, &params.out, sizeof(params.out)))
 		ret = -EFAULT;
 unlock:
 	mutex_unlock(&rv->mutex);
@@ -2929,8 +3352,7 @@ static void rv_hb_done(struct ib_cq *cq, struct ib_wc *wc)
 	struct rv_sconn *sconn = container_of(wc->wr_cqe,
 					      struct rv_sconn, hb_cqe);
 
-	trace_rv_wc_hb_done((u64)sconn, wc->status, wc->opcode, wc->byte_len,
-			    0);
+	trace_rv_wc_hb_done(wc);
 	trace_rv_sconn_hb_done(sconn, sconn->index,
 			       sconn->qp ? sconn->qp->qp_num : 0,
 			       sconn->parent, sconn->flags,
@@ -2959,23 +3381,11 @@ static void rv_hb_done(struct ib_cq *cq, struct ib_wc *wc)
  */
 static void rv_sconn_hb_work(struct work_struct *work)
 {
-	struct rv_sconn *sconn = container_of(work, struct rv_sconn,
-					      hb_work);
-#ifdef RV_HB_RDMA
-	struct ib_rdma_wr swr = {
-		.remote_addr = sconn->remote_hb_addr,
-		.rkey = sconn->remote_hb_rkey,
-		.wr = {
-			.opcode	= IB_WR_RDMA_WRITE,
-#else
+	struct rv_sconn *sconn = container_of(work, struct rv_sconn, hb_work);
 	struct ib_send_wr swr = {
 			.opcode	= IB_WR_SEND,
-#endif
 			.wr_cqe	= &sconn->hb_cqe,
 			.send_flags = IB_SEND_SIGNALED,
-#ifdef RV_HB_RDMA
-		},
-#endif
 	};
 	u64 old_act_count;
 	int ret;
@@ -3002,11 +3412,7 @@ static void rv_sconn_hb_work(struct work_struct *work)
 			       sconn->parent, sconn->flags,
 			       (u32)sconn->state, 0);
 	rv_conn_get(sconn->parent);
-#ifdef RV_HB_RDMA
-	ret = ib_post_send(sconn->qp, &swr.wr, NULL);
-#else
 	ret = ib_post_send(sconn->qp, &swr, NULL);
-#endif
 	if (ret) {
 		sconn->stats.post_hb_fail++;
 		rv_conn_err(sconn, "failed to send hb: post %d\n", ret);
@@ -3024,8 +3430,7 @@ unlock:
 /* called at SOFT IRQ,  so real work in WQ */
 static void rv_sconn_hb_func(struct timer_list *timer)
 {
-	struct rv_sconn *sconn = container_of(timer, struct rv_sconn,
-					      hb_timer);
+	struct rv_sconn *sconn = container_of(timer, struct rv_sconn, hb_timer);
 
 	if (!sconn->parent)
 		return;
@@ -3080,13 +3485,16 @@ static struct rv_listener *rv_listener_alloc(struct rv_device *dev,
 		goto err_free;
 	}
 
+#ifdef IB_CM_LISTEN_WITHOUT_MASK
+	ret = ib_cm_listen(listener->cm_id, cpu_to_be64(service_id));
+#else
 	ret = ib_cm_listen(listener->cm_id, cpu_to_be64(service_id), 0);
+#endif
 	if (ret) {
-		rv_ptr_err("listener", listener,
-			   "CM listen failed: %d\n", ret);
+		rv_ptr_err("listener", listener, "CM listen failed: %d\n", ret);
 		goto err_cm;
 	}
-	kref_get(&dev->kref);
+	rv_device_get(dev);
 	listener->dev = dev;
 
 	kref_init(&listener->kref);
@@ -3119,7 +3527,7 @@ struct rv_listener *rv_listener_get_alloc(struct rv_device *dev, u64 service_id,
 	spin_unlock_irqrestore(&dev->listener_lock, flags);
 	entry = rv_listener_alloc(dev, service_id, handler);
 	if (!entry)
-		goto done;
+		goto unlock_mutex;
 	trace_rv_listener_get(dev->ib_dev->name, service_id,
 			      kref_read(&entry->kref));
 	spin_lock_irqsave(&dev->listener_lock, flags);
@@ -3127,6 +3535,7 @@ struct rv_listener *rv_listener_get_alloc(struct rv_device *dev, u64 service_id,
 
 done:
 	spin_unlock_irqrestore(&dev->listener_lock, flags);
+unlock_mutex:
 	mutex_unlock(&dev->listener_mutex);
 	return entry;
 }

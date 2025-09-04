@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 
 /* This file contains the base of the rendezvous RDMA driver */
@@ -16,10 +16,15 @@
 #include "trace.h"
 
 MODULE_AUTHOR("Kaike Wan");
-MODULE_DESCRIPTION("Rendezvous Kmod");
+MODULE_DESCRIPTION("Intel RDMA Rendezvous Module");
 MODULE_LICENSE("Dual BSD/GPL");
+MODULE_VERSION(RV_DRIVER_VERSION);
 
+#ifndef IB_CLIENT_ADD_RETURN_INT
 static void rv_add_one(struct ib_device *device);
+#else
+static int rv_add_one(struct ib_device *device);
+#endif
 static void rv_remove_one(struct ib_device *device, void *client_data);
 #ifdef HAS_DEV_RENAME  /* currently only upstream */
 static void rv_rename_dev(struct ib_device *device, void *client_data);
@@ -37,7 +42,8 @@ static struct ib_client rv_client = {
 static struct list_head rv_dev_list;	/* list of rv_device */
 static spinlock_t rv_dev_list_lock;
 
-struct rv_device *rv_device_get(char *dev_name, struct rv_user *rv)
+/* get a device reference and add an rv_user to rv_device.user_list */
+struct rv_device *rv_device_get_add_user(char *dev_name, struct rv_user *rv)
 {
 	struct rv_device *dev;
 	unsigned long flags;
@@ -66,10 +72,15 @@ static void rv_device_release(struct kref *kref)
 	kfree(dev);
 }
 
+void rv_device_get(struct rv_device *dev)
+{
+	kref_get(&dev->kref);
+}
+
 void rv_device_put(struct rv_device *dev)
 {
-	trace_rv_dev_put((dev->ib_dev && dev->ib_dev->name) ?
-			 dev->ib_dev->name : "nil", kref_read(&dev->kref));
+	trace_rv_dev_put(dev->ib_dev ? dev->ib_dev->name : "nil",
+			 kref_read(&dev->kref));
 	kref_put(&dev->kref, rv_device_release);
 }
 
@@ -122,23 +133,54 @@ static void rv_device_event_handler(struct ib_event_handler *handler,
 	}
 }
 
+#ifndef IB_CLIENT_ADD_RETURN_INT
 static void rv_add_one(struct ib_device *device)
+#else
+static int rv_add_one(struct ib_device *device)
+#endif
 {
 	struct rv_device *dev;
 	unsigned long flags;
+	struct ib_device_attr attr;
+	struct ib_udata udata;
+	int ret;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev) {
-		rv_ptr_err("ib_device", device,
-			   "Failed to alloc memory for %s\n",  device->name);
+	if (!dev)
+#ifndef IB_CLIENT_ADD_RETURN_INT
 		return;
-	}
+#else
+		return -ENOMEM;
+#endif
 	dev->ib_dev = device;
 	kref_init(&dev->kref);
 	mutex_init(&dev->listener_mutex);
 	spin_lock_init(&dev->listener_lock);
 	INIT_LIST_HEAD(&dev->listener_list);
 	INIT_LIST_HEAD(&dev->user_list);
+	/*
+	 * Make sure the query_device() call is not under any spin_lock
+	 * as the call may sleep. In addition, provide the dummy udata to
+	 * avoid crash in some RDMA devices (eg irdma).
+	 */
+	memset(&udata, 0, sizeof(udata));
+#ifdef HAVE_IB_DEVICE_OPS
+	ret = device->ops.query_device(device, &attr, &udata);
+#else
+	ret = device->query_device(device, &attr, &udata);
+#endif
+	if (ret) {
+		rv_err(RV_INVALID,
+		       "query_device() failed for device %s: ret %d\n",
+		       device->name, ret);
+		kfree(dev);
+#ifndef IB_CLIENT_ADD_RETURN_INT
+		return;
+#else
+		return ret;
+#endif
+	}
+	dev->max_fast_reg_page_list_len = attr.max_fast_reg_page_list_len;
 	spin_lock_irqsave(&rv_dev_list_lock, flags);
 	list_add(&dev->dev_entry, &rv_dev_list);
 	spin_unlock_irqrestore(&rv_dev_list_lock, flags);
@@ -148,10 +190,26 @@ static void rv_add_one(struct ib_device *device)
 	INIT_IB_EVENT_HANDLER(&dev->event_handler, device,
 			      rv_device_event_handler);
 	ib_register_event_handler(&dev->event_handler);
-
-	return;
+#ifdef IB_CLIENT_ADD_RETURN_INT
+	return 0;
+#endif
 }
 
+/*
+ * Called on device removal, gets users off the device
+ *
+ * At the same time, applications will get device async events which should
+ * trigger them to start user space cleanup and close.
+ *
+ * We remove the rv_user from the user_list so that the user application knows
+ * that the remove_one handler is cleaning up this rv_user. After this,
+ * the rv->user_entry itself is an empty list, an indicator that the
+ * remove_one handler owns this rv_user.
+ *
+ * To comply with lock heirarchy, we must release rv_dev_list_lock so
+ * rv_detach_user can get rv->mutex.  The empty rv->user_entry will prevent
+ * a race with rv_user starting its own detach.
+ */
 static void rv_device_detach_users(struct rv_device *dev)
 {
 	unsigned long flags;
@@ -161,33 +219,23 @@ static void rv_device_detach_users(struct rv_device *dev)
 	while (!list_empty(&dev->user_list)) {
 		rv = list_first_entry(&dev->user_list, struct rv_user,
 				      user_entry);
-		/*
-		 * Remove the rv_user from the user_list so that the user
-		 * application knows that the remove_one handler is cleaning
-		 * up this rv_user. After this, the rv->user_entry itself is
-		 * an empty list, an indicator that the remove_one handler
-		 * owns this rv_user.
-		 */
 		list_del_init(&rv->user_entry);
 
-		/*
-		 * Since we can't take the rv->mutex after holding
-		 * rv_dev_list_lock, we have to release it first.
-		 * Since the user application knows that the remove_one handler
-		 * owns the rv_user, there is no risk that the user application
-		 * will detach it.
-		 */
 		spin_unlock_irqrestore(&rv_dev_list_lock, flags);
-
-		/* Release resources */
 		rv_detach_user(rv);
-
-		/* Acquire the rv_dev_list_lock again for next rv_user */
 		spin_lock_irqsave(&rv_dev_list_lock, flags);
 	}
 	spin_unlock_irqrestore(&rv_dev_list_lock, flags);
 }
 
+/*
+ * device removal handler
+ *
+ * we allow a wait_time of 2 seconds for applications to cleanup themselves
+ * and close.  Typically they will get an async event and react quickly.
+ * After which we begin forcibly removing the remaining users and
+ * then wait for the internal references to get releaseed by their callbacks
+ */
 static void rv_remove_one(struct ib_device *device, void *client_data)
 {
 	struct rv_device *dev = client_data;
@@ -197,37 +245,25 @@ static void rv_remove_one(struct ib_device *device, void *client_data)
 	unsigned long end;
 
 	trace_rv_dev_remove(device->name, kref_read(&dev->kref));
-	/*
-	 * Remove the device from the device list so that no new rv_user
-	 * can be attached to it.
-	 */
 	spin_lock_irqsave(&rv_dev_list_lock, flags);
 	list_del(&dev->dev_entry);
 	spin_unlock_irqrestore(&rv_dev_list_lock, flags);
 
-	/*
-	 * Wait for some time so that the user applications can finish their
-	 * cleanup after receiving the port_down notification.
-	 */
 	end = jiffies + msecs_to_jiffies(wait_time);
 	while (time_before(jiffies, end) && !list_empty(&dev->user_list))
 		schedule_timeout_interruptible(sleep_time);
 
-	/* We have to remove any remaining rv_users */
 	rv_device_detach_users(dev);
 
-	/* Wait until all resources are released */
 	while (kref_read(&dev->kref) > 1)
 		schedule_timeout_interruptible(sleep_time);
 
-	/* Finally free the device */
 	rv_device_put(dev);
 }
 
 #ifdef HAS_DEV_RENAME  /* currently only upstream */
 static void rv_rename_dev(struct ib_device *device, void *client_data)
 {
-	return;
 }
 #endif
 
@@ -237,12 +273,13 @@ static void rv_init_devices(void)
 	INIT_LIST_HEAD(&rv_dev_list);
 }
 
+/* uses syncrhnoize_rcu to ensure previous kfree_rcu of references are done */
 static void rv_deinit_devices(void)
 {
 	struct rv_device *dev, *temp;
 	unsigned long flags;
 
-	synchronize_rcu(); /* make sure previous kfree_rcu have completed */
+	synchronize_rcu();
 	spin_lock_irqsave(&rv_dev_list_lock, flags);
 	list_for_each_entry_safe(dev, temp, &rv_dev_list, dev_entry) {
 		list_del(&dev->dev_entry);
@@ -253,7 +290,6 @@ static void rv_deinit_devices(void)
 
 static int __init rv_init_module(void)
 {
-
 	pr_info("Loading rendezvous module");
 
 	rv_init_devices();

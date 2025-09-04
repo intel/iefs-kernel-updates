@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 #if !defined(__RV_TRACE_DEV_H) || defined(TRACE_HEADER_MULTI_READ)
 #define __RV_TRACE_DEV_H
@@ -20,7 +20,11 @@ DECLARE_EVENT_CLASS(/* dev */
 		__field(u32, refcount)
 	),
 	TP_fast_assign(/* assign */
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(name);
+#else
 		__assign_str(name, dev_name);
+#endif
 		__entry->refcount = refcount;
 	),
 	TP_printk(/* print */
@@ -63,8 +67,13 @@ TRACE_EVENT(/* event */
 		__string(event, evt_name)
 	),
 	TP_fast_assign(/* assign */
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(device);
+		__assign_str(event);
+#else
 		__assign_str(device, dev_name);
 		__assign_str(event, evt_name);
+#endif
 	),
 	TP_printk(/* print */
 		"Device %s Event %s",

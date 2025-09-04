@@ -7,33 +7,79 @@
 ifneq ($(KERNELRELEASE),)
 #kbuild part of makefile
 
+ifneq ($(MOFED_PATH),)
+NOSTDINC_FLAGS += -I$(MOFED_PATH)/include -I$(MOFED_PATH)/include/uapi -DHAVE_MOFED
+# Get the major version
+MOFED_VER ?= $(shell cat $(MOFED_PATH)/compat_base | cut -d '-' -f 4)
+MOFED_MAJ_VER ?= $(shell echo $(MOFED_VER) | cut -c3-4 | sed 's/^0//')
+MOFED_MIN_VER ?= $(shell echo $(MOFED_VER) | cut -c5-6 | sed 's/^0//')
+$(info *** Detected MOFED_VER: $(MOFED_VER) ($(MOFED_MAJ_VER).$(MOFED_MIN_VER)) *** )
+NOSTDINC_FLAGS += -DMOFED_MJVER=$(MOFED_MAJ_VER)
+NOSTDINC_FLAGS += -DMOFED_MINVER=$(MOFED_MIN_VER)
+endif
 NOSTDINC_FLAGS += -I${M}/include -I${M}/compat
 ifneq ($(NVIDIA_GPU_DIRECT),)
 NOSTDINC_FLAGS += -DNVIDIA_GPU_DIRECT
 endif
+ifneq ($(INTEL_GPU_DIRECT),)
+NOSTDINC_FLAGS += -DINTEL_GPU_DIRECT
+ifneq ($(INTEL_GPU_DIRECT),CURRENT_KERNEL)
+BACKPORT_DIR := $(INTEL_GPU_DIRECT)
+BACKPORT_INC := $(BACKPORT_DIR)/backport-include
+
+ifneq ("$(wildcard $(BACKPORT_DIR)/drm-include)","")
+DMA_INC := $(BACKPORT_DIR)/drm-include
+else ifneq ("$(wildcard $(BACKPORT_DIR)/include)","")
+DMA_INC := $(BACKPORT_DIR)/include
+endif
+
+INC_HEADERS :=
+ifneq ("$(wildcard $(BACKPORT_INC)/backport/backport.h)","")
+INC_HEADERS += -include $(BACKPORT_INC)/backport/backport.h
+endif
+ifneq ("$(wildcard $(BACKPORT_INC)/backport/backport_macro.h)","")
+INC_HEADERS += -include $(BACKPORT_INC)/backport/backport_macro.h
+endif
+
+LINUXINCLUDE := \
+	-DCONFIG_BACKPORT_INTEGRATE \
+	-I$(BACKPORT_INC) -I$(BACKPORT_INC)/uapi \
+	-I$(DMA_INC) -I$(DMA_INC)/uapi \
+	$(INC_HEADERS) \
+	${LINUXINCLUDE}
+endif
+endif
 
 obj-$(CONFIG_INFINIBAND_RV) += rv.o
 
-rv-y := rv_main.o rv_file.o gpu.o rv_mr_cache.o gdr_ops.o trace.o \
+rv-y := rv_main.o rv_file.o rv_mr_cache.o gdr_ops.o trace.o \
 	compat_common.o compat.o rv_mr.o rv_rdma.o rv_conn.o
 
 CFLAGS_trace.o = -I$(src)
 
 ifneq ($(NVIDIA_GPU_DIRECT),)
-CFLAGS_driver.o = -DRV_IDSTR=\"gpu-direct\"
-CFLAGS_gpu.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
-CFLAGS_rv_main.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_rv_main.o = -DRV_IDSTR=\"gpu-direct\"
+CFLAGS_rv_main.o += -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_rv_file.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_rv_mr_cache.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_rv_mr.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_rv_rdma.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_rv_conn.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
 CFLAGS_gdr_ops.o = -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+CFLAGS_trace.o += -I$(NVIDIA_GPU_DIRECT) -I$(NVIDIA_GPU_DIRECT)/nvidia
+endif
+ifneq ($(INTEL_GPU_DIRECT),)
+CFLAGS_rv_main.o = -DRV_IDSTR=\"oneapize\"
+endif
+
+ifdef MVERSION
+CFLAGS_rv_main.o += -DRV_DRIVER_VERSION_BASE=\"$(MVERSION)\"
 endif
 
 else
 #normal makefile
-KDIR ?= /lib/modules/`uname -r`/build
+kver ?= `uname -r`
+KDIR ?= /lib/modules/$(kver)/build
 
 default:
 	$(MAKE) -C $(KDIR) M=$$PWD CONFIG_INFINIBAND_RV=m NOSTDINC_FLAGS=-I$$PWD

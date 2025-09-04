@@ -30,6 +30,7 @@
 #define HAVE_ATOMIC_FETCH_ADD_UNLESS
 #define TYPE_CLASS_NO_NEEDS_KFREE_RCU
 #define HAVE_XARRAY
+#define IB_UMEM_GET_WITH_UDATA
 
 #include "compat_common.h"
 

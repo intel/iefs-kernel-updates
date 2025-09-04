@@ -18,13 +18,15 @@ BuildRequires:  %kernel_module_package_buildreqs
 %define arch %(uname -p)
 Requires:	kernel = %(echo %{kver} | sed -e 's/\(.*\)\.%{arch}/\1/g')
 
+%define kbase %(echo %{kver} | sed -ne "s/-.*//p")
+
 %kernel_module_package -f %{SOURCE1} default
 
 # find our target version
 %global kbuild %(
-if [ -z "$kbuild" ]; then 
+if [ -z "$kbuild" ]; then
 	echo "/lib/modules/%{kver}/build"
-else 
+else
 	echo "$kbuild"
 fi
 )
@@ -89,7 +91,7 @@ for flavor in %flavors_to_build; do
 		rm -rf $mod
 		cp -r "$mod"_$flavor $mod
 		done
-	echo rpm kernel_source %{kernel_source $flavor}
+	echo rpm kernel source %{kernel_source $flavor}
 	if [ -z "%mversion" ]; then
 		make -j 8 CONFIG_INFINIBAND_RV=m KDIR=%{kernel_source $flavor} M=$PWD
 	else
@@ -124,21 +126,35 @@ done
 install -m 644 -D %{SOURCE3} $RPM_BUILD_ROOT%{_sysconfdir}/modules-load.d/%{name}.conf
 (targetdir=$RPM_BUILD_ROOT%{_includedir}/uapi/rdma/hfi/
  mkdir -p $targetdir
- rvsrcdir=$(pwd)/include/uapi/rv
+ rvsrcdir=$(pwd)/include/uapi/rdma
  cd %kdir
- rvtargetdir=$RPM_BUILD_ROOT%{_includedir}/uapi/rv/
+ rvtargetdir=$RPM_BUILD_ROOT%{_includedir}/rdma
  mkdir -p $rvtargetdir
- sh ./scripts/headers_install.sh $rvtargetdir $rvsrcdir rv_user_ioctls.h)
+
+# handle a different headers_install (eg. upstream kernel)
+if sh ./scripts/headers_install.sh | grep -q OUTDIR; then
+        sh ./scripts/headers_install.sh $rvtargetdir $rvsrcdir rv_user_ioctls.h
+else
+        sh ./scripts/headers_install.sh $rvsrcdir/rv_user_ioctls.h ${rvtargetdir}/rv_user_ioctls.h
+fi)
+
 (mkdir -p $RPM_BUILD_ROOT%{_usrsrc}/%{name}-%{release}/
 cp -r * $RPM_BUILD_ROOT%{_usrsrc}/%{name}-%{release})
 
 %post dkms
-dkms add -m %{name} -v %{release} || :
-dkms build -m %{name} -v %{release} || :
-dkms install -m %{name} -v %{release} --force || :
+dkms add -m %{name} -v %{release} --rpm_safe_upgrade || :
+for kd in /lib/modules/%{kbase}*; do
+	bdir="${kd}/build";
+	kv=$(echo $kd | cut -d '/' -f 4);
+	if [ -e $bdir ]; then
+		dkms install -m %{name} -v %{release} -k ${kv} --force || :
+	else
+		echo "SKIP ${kv}: Headers not found";
+	fi
+done
 
 %preun dkms
-dkms remove -m %{name} -v %{release} --all || :
+dkms remove -m %{name} -v %{release} --all --rpm_safe_upgrade || :
 
 %files -n kmod-%{name}
 %defattr(644,root,root,755)
@@ -154,9 +170,11 @@ dkms remove -m %{name} -v %{release} --all || :
 
 %files devel
 %defattr(-,root,root,-)
-%{_includedir}/uapi/rv/rv_user_ioctls.h
+%{_includedir}/rdma/rv_user_ioctls.h
 
 
 %changelog
+* Thu Oct 05 2023 Adam Goldman <adam.goldman@intel.com>
+- Update dkms post install logic to build for all possible kernels
 * Mon Oct 19 2020 Kaike Wan <Kaike.wan@intel.com>
 - Initial release.

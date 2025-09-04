@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause)
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 
 #include "compat.h"
@@ -16,7 +16,7 @@ lookup_get_idr_uobject(const struct uverbs_api_object *obj,
         unsigned long idrno = id;
 #endif
 
-        if (id < 0 || id > ULONG_MAX)
+	if (id < 0)
                 return ERR_PTR(-EINVAL);
 
         rcu_read_lock();
@@ -45,6 +45,7 @@ free:
         return uobj;
 }
 
+#ifndef HAVE_FUNC_UVERBS_TRY_LOCK_OBJECT
 static int uverbs_try_lock_object(struct ib_uobject *uobj,
                                   enum rdma_lookup_mode mode)
 {
@@ -75,6 +76,7 @@ static int uverbs_try_lock_object(struct ib_uobject *uobj,
         }
         return 0;
 }
+#endif
 
 static void uverbs_uobject_free(struct kref *ref)
 {
@@ -175,7 +177,6 @@ void rdma_lookup_put_uobject(struct ib_uobject *uobj,
                              enum rdma_lookup_mode mode)
 {
         assert_uverbs_usecnt(uobj, mode);
-        uobj->uapi_object->type_class->lookup_put(uobj, mode);
         /*
          * In order to unlock an object, either decrease its usecnt for
          * read access or zero it in case of exclusive access. See
@@ -192,11 +193,12 @@ void rdma_lookup_put_uobject(struct ib_uobject *uobj,
                 break;
         }
 
+        uobj->uapi_object->type_class->lookup_put(uobj, mode);
         /* Pairs with the kref obtained by type->lookup_get */
         uverbs_uobject_put(uobj);
 }
 
-#ifndef HAVE_XARRAY
+#if !defined(HAVE_XARRAY) && !defined(HAVE_MOFED)
 int xa_alloc_irq(struct xarray *xa, u32 *id,
 		 void *entry, struct xa_limit limit, gfp_t gfp)
 {

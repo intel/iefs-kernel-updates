@@ -4,6 +4,11 @@
 #
 # Called from the kernel module build system.
 #
+
+ifneq ($(MOFED_PATH),)
+KBUILD_EXTRA_SYMBOLS += $(MOFED_PATH)/Module.symvers
+endif
+
 ifneq ($(KERNELRELEASE),)
 #kbuild part of makefile
 
@@ -12,7 +17,8 @@ obj-y := rv/
 
 else
 #normal makefile
-KDIR ?= /lib/modules/`uname -r`/build
+kver ?= `uname -r`
+KDIR ?= /lib/modules/$(kver)/build
 
 default:
 	$(MAKE) -C $(KDIR) CONFIG_INFINIBAND_RV=m M=$$PWD

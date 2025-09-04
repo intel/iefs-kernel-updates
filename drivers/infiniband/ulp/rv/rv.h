@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2021 Intel Corporation.
  */
 
 #ifndef __RV_H__
@@ -12,7 +12,6 @@
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_sa.h>
 #include <rdma/ib_cm.h>
-#include <rdma/ib_fmr_pool.h>
 #include <rdma/rdma_cm.h>
 #include <linux/mutex.h>
 #include <linux/socket.h>
@@ -27,12 +26,30 @@
 
 #include "rv_mr_cache.h"
 #include "rv_user_ioctls.h"
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+#include "gdr_ops.h"
+#endif
 
 #include "compat.h"
 
+#ifndef RV_DRIVER_VERSION_BASE
+#define RV_DRIVER_VERSION_BASE "11.1.0.0"
+#endif
+
+/* create the final driver version string */
+#ifdef RV_IDSTR
+#define RV_DRIVER_VERSION RV_DRIVER_VERSION_BASE " " RV_IDSTR
+#else
+#define RV_DRIVER_VERSION RV_DRIVER_VERSION_BASE
+#endif
+
+/* XXX how to mark GPU specific locks below */
 /*
  * Lock Heirachy
  * In order that locks can be acquired:
+ * mm->mmap_lock - held during mmap call and mmu_notifier_register
+ * GPU page handling lock in nVidia driver - held by GPU get_pages_free_callback
+ *			and obtained by GPU put_pages
  * rv_user.mutex
  * rv_job_dev_list_mutex
  * rv_job_dev.conn_list_mutex
@@ -41,9 +58,12 @@
  *	because destroy cm_id will wait for handlers via it's mutex and deadlock
  * rv_job_dev_list rcu
  * rv_dev_list_lock
+ * rv_gdrdata.mr_lock
  * rv_job_dev.conn_list rcu - no sub locks
+ * gdr_mr.lock - no sub locks
  * rv_device.listener_lock - no sub locks
  * rv_user.umrs.cache.lock - no sub locks
+ * rv_user.umrs.pool.lock - no sub locks
  * rv_job_dev.user_array_lock - no sub locks
  * ring.lock - no sub locks
  * mr_pd_uobject_lock - no sub locks
@@ -84,11 +104,12 @@
 
 /* For errors to surface on the console */
 #define rv_err(idx, fmt, ...) \
-	pr_err("[%s:%s %d]: " fmt, DRIVER_NAME, __func__, idx, ##__VA_ARGS__)
+	pr_err_ratelimited("[%s:%s %d]: " fmt, DRIVER_NAME, __func__, idx, \
+			   ##__VA_ARGS__)
 
 #define rv_ptr_err(prefix, ptr, fmt, ...) \
-	pr_err("[%s:%s %s 0x%p]: " fmt, DRIVER_NAME, __func__, prefix, ptr, \
-		##__VA_ARGS__)
+	pr_err_ratelimited("[%s:%s %s 0x%p]: " fmt, DRIVER_NAME, __func__, \
+			   prefix, ptr, ##__VA_ARGS__)
 
 /* For debugging*/
 #define rv_dbg(idx, fmt, ...) \
@@ -122,6 +143,20 @@
 #define rv_cm_err(ptr, fmt, ...) rv_ptr_err("cm_id", ptr, fmt, ##__VA_ARGS__)
 #define rv_cm_info(ptr, fmt, ...) rv_ptr_info("cm_id", ptr, fmt, ##__VA_ARGS__)
 #define rv_cm_dbg(ptr, fmt, ...) rv_ptr_dbg("cm_id", ptr, fmt, ##__VA_ARGS__)
+
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+#define IBV_ACCESS_RV (IBV_ACCESS_KERNEL | IBV_ACCESS_IS_GPU_ADDR)
+#else
+#define IBV_ACCESS_RV IBV_ACCESS_KERNEL
+#endif
+
+#if (defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)) && !defined(RV_REG_MR_DISCRETE)
+#define RV_ACC_CHECK(acc) \
+		(((acc) & IBV_ACCESS_KERNEL) && \
+		 ((acc) & IBV_ACCESS_IS_GPU_ADDR))
+#else
+#define RV_ACC_CHECK(acc) ((acc) & IBV_ACCESS_KERNEL)
+#endif
 
 struct rv_device;
 
@@ -163,6 +198,8 @@ struct rv_device {
 	struct list_head listener_list;
 
 	struct list_head user_list;
+
+	u32 max_fast_reg_page_list_len;
 };
 
 #define RV_CONN_MAX_ACTIVE_WQ_ENTRIES 100 /* used for conn handling */
@@ -173,8 +210,23 @@ struct rv_device {
 /* duration client spends in RV_DELAY before re-attempt reconnect */
 #define RV_RECONNECT_DELAY msecs_to_jiffies(100)
 
-/* XXX - finish RDMA implementation & remove ifdefs and stats.recv_hb_cqe */
-#undef RV_HB_RDMA /* when undef use send, when def use 0 len RDMA Write */
+/* private data in REQ and REP is used to negotiate features and exchange
+ * additional informaton.
+ * REQ.ver is the version of the sender and defines the priv_data structure.
+ * Newer versions of struct should be a superset of older versions.
+ * REP.ver is the version the listener is accepting and defines REP priv_data.
+ * New client, old listerner:
+ *	listener accepts REQ >= it's version, responds with it's version in REP
+ * Old client, new listener:
+ *	listener accepts REQ, responds with REP matching client's version
+ * Protocol ver is now 2.  For simplicity protocol 0 and 1 (pre-releases) are
+ * not accepted.
+ *
+ * Private data in DREQ, REJ is used to indicate RV reason and recoverability
+ */
+
+#define RV_PRIVATE_DATA_MAGIC 0x00125550534d2121ULL
+#define RV_PRIVATE_DATA_VER 2
 
 /*
  * Private data used in CM REQ
@@ -182,12 +234,8 @@ struct rv_device {
  * index indicates index of rv_sconn within it's rv_conn and differentiates
  * the multiple connection REQs for num_conn > 1
  * The job_key selects the rv_job_dev on receiver side
- * hb_addr, hb_rkey exchange information needed for RV heartbeat RDMA Writes
- * to the REQ requestor.
  * uid is 32b
  */
-#define RV_PRIVATE_DATA_MAGIC 0x00125550534d2121ULL
-#define RV_PRIVATE_DATA_VER 1
 struct rv_req_priv_data {
 	u64 magic;
 	u32 ver;
@@ -195,9 +243,62 @@ struct rv_req_priv_data {
 	u8 index;
 	u8 job_key_len;
 	u8 job_key[RV_MAX_JOB_KEY_LEN];
-	u64 hb_addr;
-	u32 hb_rkey;
 	uid_t uid;
+};
+
+/*
+ * Private data used in CM REP
+ * laid out for good alignment of fields without packing
+ */
+struct rv_rep_priv_data {
+	u64 magic;
+	u32 ver;
+};
+
+enum rv_dreq_reason {
+	RV_DREQ_REASON_NONE =		0,
+	RV_DREQ_REASON_CLOSE =		1,	/* normal job close */
+	RV_DREQ_REASON_RTU_UNEXP =	2,	/* unexpected RTU */
+	RV_DREQ_REASON_LOCAL_ERR =	3,	/* local error */
+	RV_DREQ_REASON_QP_ERR =		4,	/* QP error */
+	RV_DREQ_REASON_CQ_ERR =		5,	/* CQ error */
+	RV_DREQ_REASON_CONN_TIMEOUT =	6,	/* conn timeout */
+};
+
+/*
+ * Private data used in CM DREQ
+ * laid out for good alignment of fields without packing
+ */
+struct rv_dreq_priv_data {
+	u64 magic;
+	u32 ver;
+	u32 reason;
+	u8 recoverable;
+};
+
+enum rv_rej_reason {
+	RV_REJ_REASON_NONE =		0,
+	RV_REJ_REASON_INVALID_REQ =	1,	/* invalid RV REQ */
+	RV_REJ_REASON_INVALID_REP =	2,	/* invalid RV REP */
+	RV_REJ_REASON_NOT_FOUND =	3,	/* no matching sconn found */
+	RV_REJ_REASON_MISMATCH =	4,	/* mismatched params or path */
+	RV_REJ_REASON_LOCAL_ERR =	5,	/* local error */
+	RV_REJ_REASON_ERROR =		6,	/* already moved to RV_ERROR */
+	RV_REJ_REASON_CONNECTING =	7,	/* preparing to reconnect */
+	RV_REJ_REASON_DISCONNECTING =	8,	/* disconnecting */
+	RV_REJ_REASON_NOT_LISTENER =	9,	/* we expect to be client */
+	RV_REJ_REASON_CONN_TIMEOUT =	10,	/* conn timeout */
+};
+
+/*
+ * Private data used in CM REJ
+ * laid out for good alignment of fields without packing
+ */
+struct rv_rej_priv_data {
+	u64 magic;
+	u32 ver;
+	u32 reason;
+	u8 recoverable;
 };
 
 /*
@@ -463,14 +564,13 @@ enum rv_sconn_state {
  * Async QP Draining,
  *	drain_lock -  protects these and enter;test of RC_SCONN_*DRAIN* flags
  *	drain_lock, rdrain_cqe, sdrain_cqe, drain_work (for drain done handler)
- *	drain_timer - for drain timeout (RV_ENABLE_DRAIN_TIMEOUT)
+ *	drain_timer - for drain timeout
  *	done_wr_list - most recent completed pend_wr's
  *	done_wr_count - number of entries on list
  *
  * reconnect_timeout timer: conn_timer, timer_work
  * RV_DELAY timer: delay_timer, delay_work
- * Heartbeat: hb_timer, act_count (activity since last hb), remote_hb_*, hb_cqe
- *		hb_work
+ * Heartbeat: hb_timer, act_count (activity since last hb), hb_cqe, hb_work
  *
  * Stats:
  *	all but atomic CQE stats protected by rv_sconn.mutex
@@ -539,8 +639,6 @@ struct rv_sconn {
 
 	struct timer_list hb_timer;
 	u64 act_count;
-	u64 remote_hb_addr;
-	u32 remote_hb_rkey;
 	struct ib_cqe hb_cqe;
 	struct work_struct hb_work;
 
@@ -621,25 +719,79 @@ struct rv_conn {
  */
 #define RV_DFLT_SERVICE_ID 0x1000125500000001ULL
 
+#ifdef RV_REG_MR_DISCRETE
+struct rv_fr_desc {
+	struct list_head		entry;
+	struct rv_fr_pool		*pool;
+	struct ib_mr			*mr;
+	bool				is_new;
+};
+
+/* 4MB max message size from PSM */
+#define RV_MAX_PAGE_LIST_LEN 1024
+#define RV_FR_POOL_BATCH_SIZE_MIN 64
+/* Default batch allocation size */
+#define RV_FR_POOL_BATCH_SIZE 256
+/* Low water marks for free descriptors */
+#define RV_FR_POOL_WM_LO 64
+
+/*
+ * Size - Total number of fr descriptor entries.
+ * free_size - Number of free entries
+ * max_page_list_len - Max num of scatterlist entries for an MR.
+ * umrs - Pointer to the parent rv_user_mrs.
+ * alloc_work - Work to allocate fr descriptors in batch.
+ * lock - Protect size, free_size, free_list, used_list.
+ * free_list - List of free entries.
+ * used_list - List of used entries.
+ * put_list - coming from completions
+ * cqe - completion queue event.
+ * done - completion used to prevent overflowing the QP's send queue.
+ * inv_cnt - Number of LOCAL_INV requests since last drain.
+ * wait_cnt - Number of pool entries requested since the last time the batch
+ *            allocation work is scheduled. This counter is protected
+ *            by rv_user->mutex because rv_fr_pool_get is only called by
+ *            rv_kern_reg_mem, which is protected by rv_user->mutex.
+ * put_cnt - Number of entries on the put_list.
+ */
+struct rv_fr_pool {
+	int			size;
+	int			free_size;
+	int			max_page_list_len;
+	struct rv_user_mrs	*umrs;
+	struct work_struct	alloc_work;
+	struct mutex		lock;
+	struct list_head	free_list;
+	struct list_head        used_list;
+	struct list_head        put_list;
+	struct ib_cqe		cqe;
+	struct completion	done;
+	atomic_t		inv_cnt;
+	int			wait_cnt;
+	int			put_cnt;
+};
+#endif
+
 /*
  * the set of MRs registered by a single rv_user (on a single NIC)
  * These are cached for efficiency.
  * When using kernel rendezvous QPs (eg. rv_conn) these MRs are
  * registered with the rv_job_dev.pd.
- * When using user space QPs, we register with the user supplied pd
- * cache has it's own lock
- * jdev, rv_inx , CQs, QP set once at alloc
+ * When using user space QPs, we register with the user supplied pd.
+ * cache has it's own lock.
+ * jdev, rv_inx, tgid , CQs, QP set once at alloc.
  * need parent rv_user.mutex for: cqe, post REG_MR to QP (doit_reg_mem), stats
  */
 struct rv_user_mrs {
 	struct rv_mr_cache cache;
 	struct rv_job_dev *jdev;
 	int rv_inx; /* our creator, for logging */
+	struct pid *tgid;
 
 	struct kref kref;
 	struct work_struct put_work;
 
-#ifdef RV_REG_MR_DISCRETE
+#if defined(RV_REG_MR_DISCRETE) || defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 	/*
 	 * to register MRs against a kernel pd we need to use a REG_MR WQE
 	 * on an RC QP.  This QP serves that purpose and avoids HoL blocking
@@ -652,14 +804,54 @@ struct rv_user_mrs {
 	struct ib_cq *send_cq;
 	struct ib_cq *recv_cq;
 	struct ib_qp *qp;
+#ifdef RV_REG_MR_DISCRETE
+	bool is_down;
+	struct rv_fr_pool *pool;
+#endif
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	u8     port_num;
+	u16    loc_gid_index;
+	struct rv_device *dev;
+	struct ib_qp *user_qp;
+	struct ib_mr *user_dummy_mr;
+#endif
 	struct ib_cqe req_cqe;
 	struct completion done;
 	enum ib_wc_status status;
+#endif
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	struct rv_gdrdata gdrdata;
+	struct rv_user *rv;
 #endif
 
 	struct {
 		u64 failed;	/* cache miss and failed to register */
 	} stats;
+};
+
+/*
+ * basic info about an MR
+ * ib_pd - converted from user version
+ * fd - converted from user provided cmd_fd
+ */
+struct mr_info {
+	struct ib_mr *ib_mr;
+	struct ib_pd *ib_pd;
+	struct fd fd;
+#if defined(RV_REG_MR_DISCRETE) || defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	/* For registering kernel mr */
+	struct ib_ucontext ucontext;
+	struct ib_umem *umem;
+#ifdef RV_REG_MR_DISCRETE
+	struct rv_fr_desc *desc;
+#endif
+#endif
+};
+
+/* an MR entry in the MR cache RB-tree */
+struct rv_mr_cached {
+	struct mr_info mr;
+	struct rv_mr_cache_entry entry;
 };
 
 /*
@@ -672,15 +864,17 @@ struct rv_user_mrs {
  * There will typically be 1-8 NICs per node and 1-2 concurrent jobs
  * with one rv_user per CPU core per NIC.
  *
- * kref tracks total jdev references while user_count is the subset of
- * references representing attached rv_user objects.  To get_alloc a jdev
- * we must successfully get both.  In general user_count <= kref except
- * in the middle of rv_jdev_get_alloc.
- * Once jdev.user_count == 0 or kref == 0, the jdev is destined to destruction
- * and will not be returned in subsequent searches for attach or REQ processing.
- * This only happens when a new job starts as the previous job is cleaning up
- * and is not using a unique job key.  Such cases are rare.  By decoupling the
- * jobs with different jdev's the new job may also have different attach params.
+ * kref tracks total jdev references while user_kref is the subset of
+ * references representing attached rv_user objects. user_kref <= kref.
+ * To get_alloc a jdev we must successfully get both. Once user_kref
+ * is zero, the jdev is removed from rv_job_dev_list and future attach
+ * or inbound REQ processing will not find it anymore.  At this point it is
+ * destined for destruction as soon as the remaining callbacks with a reference
+ * occur/finish. jdev get_alloc searches which see (and skip) jdevs with
+ * user_kref==0 but kfef>0 only happen when a new job starts without a unique
+ * job key, as the previous job is cleaning up. Such cases are rare.
+ * By decoupling the jobs into different jdev's the new job may also have
+ * different attach and connection params.
  *
  * These fields are immutable and can be accessed without a lock:
  *	kuid, uid, dev, pd, dev_name, port_num,
@@ -695,7 +889,6 @@ struct rv_user_mrs {
  *	reconnect_timeout (seconds), hb_interval (milliseconds),
  *	sgid_attr - local NIC gid & address for use by resolver
  *	max_users - 1<<index_bits
- *	hb_mr - MR for send/recv of heartbeat RDMA
  *
  * job_dev_entry, rcu - entry on rv_job_dev_list
  * conn_list - list of shared rv_conn, protected by RCU and conn_list_mutex
@@ -728,9 +921,6 @@ struct rv_job_dev {
 	u32 hb_interval;
 	const struct ib_gid_attr *sgid_attr;
 	int max_users;
-#ifdef RV_HB_RDMA
-	struct ib_mr *hb_mr;
-#endif
 
 	struct kref kref;
 	struct list_head job_dev_entry;
@@ -742,22 +932,25 @@ struct rv_job_dev {
 
 	spinlock_t user_array_lock;/* protects add/remove from user_array */
 	u32 user_array_next;
-	atomic_t user_count;
+	struct kref user_kref;
 	struct rv_user *user_array[];
 };
-
-/* given an rv, find the proper ib_dev to use when registering user MRs */
-#define rv_ib_dev(rv) ((((rv)->rdma_mode == RV_RDMA_MODE_USER)? \
-			(rv)->dev:(rv)->jdev->dev)->ib_dev)
 
 /*
  * rv_user represents a single open fd from a user
  * In multi-rail a process may have multiple rv_user (separate open/close)
  *
- * mutex - prevents concurrent ATTACH ioctl and protects conn_list
+ * mutex - protects state and conn_list
  *	also protects doit_reg vs self and vs doit_dreg races
- * attached - set last during ATTACH after dev/jdev, rdma_mode and cq_entries
- *	have been set.  We have no detach.
+ *	also protects umrs ptr and detach_all races
+ * state
+ *	RV_USER_UNATTACHED - never attached
+ *	RV_USER_ATTACHING - ATTACH ioctl in progress, prevents duplicate attach
+ *	RV_USER_ATTACHED - ATTACH successfully completed and dev/jdev,
+ *				rdma_mode and cq_entries have been set.
+ *	RV_USER_WAS_ATTACHED - interface detached (close or device removal).
+ *				This is a terminal state, there is no IOCTL for
+ *				detach nor reattach.
  * inx - immutable ID assignd to rv_user strictly for logging
  * rdma_mode - indicates USER (MRs only) or KERNEL (jdev, conns, etc) attach
  *	For rdma_mode KERNEL these are also valid:
@@ -771,19 +964,34 @@ struct rv_job_dev {
  *	rv_user.mutex protects, so no need to use xas_lock.
  * user_entry - entry in rv_device.user_list
  * compl - completion for detach
+ * major/minor - revision of ABI used by opening application
+ * capability - requested set of capabilities (may include unavailable cap)
  */
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+/* mutex also protects stats */
+#endif
+enum rv_user_state {
+	RV_USER_UNATTACHED = 0,
+	RV_USER_ATTACHING,
+	RV_USER_ATTACHED,
+	RV_USER_WAS_ATTACHED
+};
+
 struct rv_user {
 	struct mutex mutex; /* single thread most actions for a user */
 
 	int inx;
 
 	u8 rdma_mode;
-	u8 attached;
-	u8 was_attached;
+	enum rv_user_state state;
 	union {
 		struct rv_device *dev;
 		struct rv_job_dev *jdev;
 	};
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	/* Used for GPU_ONLY mode when dev or jdev is NULL */
+	char dev_name[RV_MAX_DEV_NAME_LEN];
+#endif
 
 	u64 context;
 	u32 cq_entries;
@@ -795,6 +1003,21 @@ struct rv_user {
 
 	struct list_head user_entry;
 	struct completion compl;
+	__u16 major_rev;
+	__u16 minor_rev;
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	__u16 gpu_major_rev;
+	__u16 gpu_minor_rev;
+#endif
+	__u64 capability;
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+	struct {
+		u64 post_write;
+		u64 post_write_bytes;
+		u64 gpu_post_write;
+		u64 gpu_post_write_bytes;
+	} stats;
+#endif
 };
 
 /*
@@ -854,7 +1077,8 @@ struct rv_pend_write {
 extern unsigned int enable_user_mr;
 
 /* Prototypes */
-struct rv_device *rv_device_get(char *dev_name, struct rv_user *rv);
+struct rv_device *rv_device_get_add_user(char *dev_name, struct rv_user *rv);
+void rv_device_get(struct rv_device *dev);
 void rv_device_put(struct rv_device *dev);
 int rv_device_del_user(struct rv_user *rv);
 
@@ -874,15 +1098,34 @@ void rv_queue_work3(struct work_struct *work);
 #endif
 
 void rv_mr_init(void);
-int doit_reg_mem(struct rv_user *rv, unsigned long arg);
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+int doit_reg_mem(struct file *fp, struct rv_user *rv, unsigned long arg,
+		 u32 rev);
+#else
+int doit_reg_mem(struct rv_user *rv, unsigned long arg, u32 rev);
+#endif
 int doit_dereg_mem(struct rv_user *rv, unsigned long arg);
+int doit_evict(struct file *fp, struct rv_user *rv, unsigned long arg);
 void rv_user_mrs_get(struct rv_user_mrs *umrs);
 void rv_user_mrs_put(struct rv_user_mrs *umrs);
-struct rv_user_mrs *rv_user_mrs_alloc(struct rv_user *rv, u32 cache_size);
-#ifdef NVIDIA_GPU_DIRECT
-int rv_drv_api_dereg_mem(struct mr_info *mr, void *addr, size_t length, unsigned int access);
+void rv_user_mrs_put_preemptible(struct rv_user_mrs *umrs);
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+struct rv_user_mrs *rv_user_mrs_alloc(struct rv_user *rv, u32 cache_size,
+				      u8 gpu, u32 gpu_cache_size);
 #else
+struct rv_user_mrs *rv_user_mrs_alloc(struct rv_user *rv, u32 cache_size,
+				      u8 gpu);
+#endif
+#if defined(RV_REG_MR_DISCRETE) || defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+int rv_user_mrs_attach(struct rv_user *rv, u32 page_list_len);
+#else
+void rv_user_mrs_attach(struct rv_user *rv, u32 page_list_len);
+#endif
+int rv_drv_api_reg_mem(struct rv_user *rv, struct rv_mem_params_in *minfo,
+		       struct mr_info *mr);
 int rv_drv_api_dereg_mem(struct mr_info *mr);
+#if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
+int rv_inv_gdr_rkey(struct rv_user_mrs *umrs, u32 access, u32 rkey);
 #endif
 
 int rv_drv_prepost_recv(struct rv_sconn *sconn);
@@ -914,14 +1157,20 @@ void rv_job_dev_put(struct rv_job_dev *jdev);
 
 static inline bool rv_job_dev_has_users(struct rv_job_dev *jdev)
 {
-	return atomic_read(&jdev->user_count);
+	return kref_read(&jdev->user_kref);
+}
+
+static inline bool rv_jdev_protocol_roce(const struct rv_job_dev *jdev)
+{
+	return rdma_protocol_roce(jdev->dev->ib_dev, jdev->port_num);
 }
 
 struct rv_sconn *
 rv_find_sconn_from_req(struct ib_cm_id *id,
-		      const struct ib_cm_req_event_param *param,
-		      struct rv_req_priv_data *priv_data);
+		       const struct ib_cm_req_event_param *param,
+		       struct rv_req_priv_data *priv_data);
 
 void rv_detach_user(struct rv_user *rv);
+int rv_query_qp_state(struct ib_qp *qp);
 
 #endif /* __RV_H__ */

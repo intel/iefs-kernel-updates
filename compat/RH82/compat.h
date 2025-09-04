@@ -36,6 +36,8 @@
 #ifdef LINUX_EFI_MOK_VARIABLE_TABLE_GUID
 #define HAVE_ATOMIC_FETCH_ADD_UNLESS
 #endif
+#define IB_UMEM_GET_WITH_UDATA
+#define IB_UMEM_GET_WITH_UDATA_DMASYNC
 
 #include "compat_common.h"
 
