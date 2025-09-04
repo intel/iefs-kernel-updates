@@ -27,6 +27,7 @@
 #define IB_UMEM_HAS_NO_NMAP
 #define IB_CM_LISTEN_WITHOUT_MASK
 #define HAVE_CLASS_MODULE_CLASS_CREATE
+#define MODULE_IMPORT_NS_HAS_STRING
 
 #include "compat_common.h"
 
