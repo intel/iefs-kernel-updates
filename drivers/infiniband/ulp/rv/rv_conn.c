@@ -1927,7 +1927,7 @@ bail_r_cq:
 		sconn->recv_cq = NULL;
 	}
 bail_s_cq:
-	if (alloced_r_cq) {
+	if (alloced_s_cq) {
 		ib_free_cq(sconn->send_cq);
 		sconn->send_cq = NULL;
 	}
