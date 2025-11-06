@@ -918,7 +918,7 @@ static int rv_create_rc_qp(struct rv_user_mrs *umrs,
 
 	if (!umrs->send_cq) {
 		umrs->send_cq = ib_alloc_cq_any(dev->ib_dev, umrs, 10,
-						IB_POLL_SOFTIRQ);
+						IB_POLL_WORKQUEUE);
 		if (IS_ERR(umrs->send_cq)) {
 			rv_err(umrs->rv_inx, "Creating send cq failed\n");
 			umrs->send_cq = NULL;
@@ -931,7 +931,7 @@ static int rv_create_rc_qp(struct rv_user_mrs *umrs,
 
 	if (!umrs->recv_cq) {
 		umrs->recv_cq = ib_alloc_cq_any(dev->ib_dev, umrs, 10,
-						IB_POLL_SOFTIRQ);
+						IB_POLL_WORKQUEUE);
 		if (IS_ERR(umrs->recv_cq)) {
 			rv_err(umrs->rv_inx, "Creating recv cq failed\n");
 			umrs->recv_cq = NULL;

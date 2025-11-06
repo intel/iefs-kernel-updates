@@ -1867,7 +1867,7 @@ static int rv_create_qp(int rv_inx, struct rv_sconn *sconn,
 
 	if (!sconn->send_cq) {
 		sconn->send_cq = ib_alloc_cq_any(jdev->dev->ib_dev, sconn,
-						 qp_depth, IB_POLL_SOFTIRQ);
+						 qp_depth, IB_POLL_WORKQUEUE);
 		if (IS_ERR(sconn->send_cq)) {
 			ret = PTR_ERR(sconn->send_cq);
 			rv_err(rv_inx, "Creating send cq failed %d\n", ret);
@@ -1879,7 +1879,7 @@ static int rv_create_qp(int rv_inx, struct rv_sconn *sconn,
 
 	if (!sconn->recv_cq) {
 		sconn->recv_cq = ib_alloc_cq_any(jdev->dev->ib_dev, sconn,
-						 qp_depth, IB_POLL_SOFTIRQ);
+						 qp_depth, IB_POLL_WORKQUEUE);
 		if (IS_ERR(sconn->recv_cq)) {
 			ret = PTR_ERR(sconn->recv_cq);
 			rv_err(rv_inx, "Creating recv cq failed %d\n", ret);
