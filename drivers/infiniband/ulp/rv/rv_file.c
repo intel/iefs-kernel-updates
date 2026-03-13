@@ -110,19 +110,17 @@ void rv_flush_work2(void)
 }
 #endif
 
-static int doit_capability(struct rv_user *rv, unsigned long arg, int rev)
+static int doit_capability(struct rv_user *rv, unsigned long arg, u32 rev)
 {
 	struct rv_capability_params params = { 0 };
 	int ret = 0;
 
-	if (rev > RV_ABI_VER_MINOR_2) {
+	if (rev > RV_ABI_VERSION(1, 2)) {
 		/* RV_IOCTL_CAPABILITY */
 		if (copy_from_user(&params, (void __user *)arg, sizeof(params)))
 			return -EFAULT;
 
-		if (params.major_rev < RV_ABI_VER_MAJOR_1 ||
-		    (params.major_rev == RV_ABI_VER_MAJOR_1 &&
-		     params.minor_rev <= RV_ABI_VER_MINOR_2)) {
+		if (RV_ABI_VERSION(params.major_rev, params.minor_rev) <= RV_ABI_VERSION(1, 2)) {
 			rv_err(rv->inx,
 			       "attach: invalid ABI rev %u.%u\n",
 			       params.major_rev, params.minor_rev);
@@ -133,9 +131,8 @@ static int doit_capability(struct rv_user *rv, unsigned long arg, int rev)
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 		/* app will check GPU HW type matches */
 		if (params.capability & RV_CAP_GPU_MASK) {
-			if (params.gpu_major_rev < RV_GPU_ABI_VER_MAJOR_1 ||
-			    (params.gpu_major_rev == RV_GPU_ABI_VER_MAJOR_1 &&
-			     params.gpu_minor_rev <= RV_GPU_ABI_VER_MINOR_1)) {
+			if (RV_GPU_ABI_VERSION(params.gpu_major_rev, params.gpu_minor_rev) <=
+			    RV_GPU_ABI_VERSION(1, 1)) {
 				rv_err(rv->inx,
 				       "attach: invalid GPU ABI rev %u.%u\n",
 				       params.gpu_major_rev, params.gpu_minor_rev);
@@ -149,11 +146,11 @@ static int doit_capability(struct rv_user *rv, unsigned long arg, int rev)
 	} else {
 		/* RV_IOCTL_QUERY_R2 */
 		/* assume app used the last ABI without RV_IOCTL_CAPABILITY */
-		rv->major_rev = RV_ABI_VER_MAJOR_1;
-		rv->minor_rev = RV_ABI_VER_MINOR_2;
+		rv->major_rev = 1;
+		rv->minor_rev = 2;
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
-		rv->gpu_major_rev = RV_GPU_ABI_VER_MAJOR_1;
-		rv->gpu_minor_rev = RV_GPU_ABI_VER_MINOR_1;
+		rv->gpu_major_rev = 1;
+		rv->gpu_minor_rev = 1;
 #endif
 		rv->capability = 0;	/* no guess, leave 0 */
 	}
@@ -541,7 +538,7 @@ static void rv_user_detach_kernel(struct rv_user *rv)
  * To avoid deadlock rv_user_mrs_alloc must be called without rv->mutex
  * because it will acquire mm->mmap_lock.
  */
-static int doit_attach(struct rv_user *rv, unsigned long arg, int rev)
+static int doit_attach(struct rv_user *rv, unsigned long arg, u32 rev)
 {
 	struct rv_attach_params params;
 	int ret;
@@ -558,9 +555,7 @@ static int doit_attach(struct rv_user *rv, unsigned long arg, int rev)
 		       "attach: capability or query must be called before attach\n");
 		return -EINVAL;
 	}
-	if (rv->major_rev > RV_ABI_VER_MAJOR_1 ||
-	    (rv->major_rev == RV_ABI_VER_MAJOR_1 &&
-	     rev > RV_ABI_VER_MINOR_5)) {
+	if (rev > RV_ABI_VERSION(1, 5)) {
 		if (copy_from_user(&params.in, (void __user *)arg,
 				   sizeof(params.in)))
 			return -EFAULT;
@@ -584,9 +579,8 @@ static int doit_attach(struct rv_user *rv, unsigned long arg, int rev)
 #ifdef INTEL_GPU_DIRECT
 	/* only newest ABI rev allowed for Intel GPU use */
 	if ((params.in.rdma_mode & (RV_RDMA_MODE_GPU|RV_RDMA_MODE_GPU_ONLY)) &&
-		(rv->gpu_major_rev < RV_GPU_ABI_VER_MAJOR_1 ||
-		 (rv->gpu_major_rev == RV_GPU_ABI_VER_MAJOR_1 &&
-		  rv->gpu_minor_rev <= RV_GPU_ABI_VER_MINOR_2))) {
+	    RV_GPU_ABI_VERSION(rv->gpu_major_rev, rv->gpu_minor_rev) <=
+	    RV_GPU_ABI_VERSION(1, 2)) {
 			rv_err(rv->inx,
 			       "attach: invalid GPU ABI rev %u.%u for Intel GPU\n",
 			       rv->gpu_major_rev, rv->gpu_minor_rev);
@@ -770,10 +764,8 @@ static int doit_attach(struct rv_user *rv, unsigned long arg, int rev)
 		 * bytes into params, which will be ignored by the old PSM3.
 		 * Therefore, there is no impact here.
 		 */
-		if (dev &&
-		    (rv->gpu_major_rev > RV_GPU_ABI_VER_MAJOR_1 ||
-		     (rv->gpu_major_rev == RV_GPU_ABI_VER_MAJOR_1 &&
-		      rv->gpu_minor_rev > RV_GPU_ABI_VER_MINOR_2)))
+		if (dev && RV_GPU_ABI_VERSION(rv->gpu_major_rev, rv->gpu_minor_rev) >
+		    RV_GPU_ABI_VERSION(1, 2))
 			params.out_gpu.max_fmr_size =
 				dev->max_fast_reg_page_list_len * PAGE_SIZE;
 		if (copy_to_user((void __user *)arg, &params.out_gpu,
@@ -788,10 +780,7 @@ static int doit_attach(struct rv_user *rv, unsigned long arg, int rev)
 	params.out.q_depth = depth_out;
 	params.out.reconnect_timeout = reconnect_timeout;
 	/* See above comments about max_fmr_size */
-	if (dev &&
-	    (rv->major_rev > RV_ABI_VER_MAJOR_1 ||
-	     (rv->major_rev == RV_ABI_VER_MAJOR_1 &&
-	      rv->minor_rev > RV_ABI_VER_MINOR_3)))
+	if (dev && RV_ABI_VERSION(rv->major_rev, rv->minor_rev) > RV_ABI_VERSION(1, 3))
 		params.out.max_fmr_size = dev->max_fast_reg_page_list_len *
 			PAGE_SIZE;
 	if (copy_to_user((void __user *)arg, &params.out, sizeof(params.out))) {
@@ -1204,8 +1193,7 @@ static int doit_get_event_stats(struct rv_user *rv, unsigned long arg)
  *	RV_IOCTL_GPU_PIN_MMAP, a request to pin and mmap a gpu buffer
  *	and return a CPU accessible address.
  */
-int doit_gpu_pin_mmap(struct file *fp, struct rv_user *rv, unsigned long arg,
-		      int rev)
+static int doit_gpu_pin_mmap(struct file *fp, struct rv_user *rv, unsigned long arg, u32 rev)
 {
 	int ret;
 
@@ -1291,34 +1279,34 @@ static long rv_file_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 	trace_rv_ioctl(rv->inx, cmd);
 	switch (cmd) {
 	case RV_IOCTL_CAPABILITY:
-		return doit_capability(rv, arg, RV_ABI_VER_MINOR);
+		return doit_capability(rv, arg, RV_ABI_VERSION_CURRENT);
 	case RV_IOCTL_QUERY_R2:
-		return doit_capability(rv, arg, RV_ABI_VER_MINOR_2);
+		return doit_capability(rv, arg, RV_ABI_VERSION(1, 2));
 
 	case RV_IOCTL_ATTACH:
-		return doit_attach(rv, arg, RV_ABI_VER_MINOR);
+		return doit_attach(rv, arg, RV_ABI_VERSION_CURRENT);
 
 	case RV_IOCTL_ATTACH_R5:
-		return doit_attach(rv, arg, RV_ABI_VER_MINOR_5);
+		return doit_attach(rv, arg, RV_ABI_VERSION(1, 5));
 
 	case RV_IOCTL_REG_MEM:
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
-		return doit_reg_mem(fp, rv, arg, RV_ABI_VER_MINOR);
+		return doit_reg_mem(fp, rv, arg, RV_ABI_VERSION_CURRENT);
 #else
-		return doit_reg_mem(rv, arg, RV_ABI_VER_MINOR);
+		return doit_reg_mem(rv, arg, RV_ABI_VERSION_CURRENT);
 #endif
 	case RV_IOCTL_REG_MEM_R1:
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
-		return doit_reg_mem(fp, rv, arg, RV_ABI_VER_MINOR_1);
+		return doit_reg_mem(fp, rv, arg, RV_ABI_VERSION(1, 1));
 #else
-		return doit_reg_mem(rv, arg, RV_ABI_VER_MINOR_1);
+		return doit_reg_mem(rv, arg, RV_ABI_VERSION(1, 1));
 #endif
 
 	case RV_IOCTL_REG_MEM_R4:
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
-		return doit_reg_mem(fp, rv, arg, RV_ABI_VER_MINOR_4);
+		return doit_reg_mem(fp, rv, arg, RV_ABI_VERSION(1, 4));
 #else
-		return doit_reg_mem(rv, arg, RV_ABI_VER_MINOR_4);
+		return doit_reg_mem(rv, arg, RV_ABI_VERSION(1, 4));
 #endif
 	case RV_IOCTL_DEREG_MEM:
 		return doit_dereg_mem(rv, arg);
@@ -1351,9 +1339,9 @@ static long rv_file_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 	case RV_IOCTL_GPU_PIN_MMAP:
-		return doit_gpu_pin_mmap(fp, rv, arg, RV_GPU_ABI_VER_MINOR);
+		return doit_gpu_pin_mmap(fp, rv, arg, RV_GPU_ABI_VERSION_CURRENT);
 	case RV_IOCTL_GPU_PIN_MMAP_R0:
-		return doit_gpu_pin_mmap(fp, rv, arg, RV_GPU_ABI_VER_MINOR_0);
+		return doit_gpu_pin_mmap(fp, rv, arg, RV_GPU_ABI_VERSION(1, 0));
 
 #endif /* NVIDIA_GPU_DIRECT || INTEL_GPU_DIRECT */
 

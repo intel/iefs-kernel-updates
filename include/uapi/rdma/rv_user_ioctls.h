@@ -20,33 +20,31 @@
 /* this version of ABI */
 #define RV_ABI_VER_MAJOR 1
 #define RV_ABI_VER_MINOR 6
+
+/* Document the changes when ABI version is changed */
 /* 1.0 and 1.1 REG_MEM in structure smaller */
-#define RV_ABI_VER_MAJOR_1 1
-#define RV_ABI_VER_MINOR_1 1
 /* ABI <= 1.2 lacks CAPABILITY ioctl */
-#define RV_ABI_VER_MINOR_2 2
 /* ABI <= 1.3 lacks max_fmr_size in attach output */
-#define RV_ABI_VER_MINOR_3 3
 /* ABI <= 1.4 lacks base_addr in REG_MEM input */
-#define RV_ABI_VER_MINOR_4 4
 /* ABI <= 1.5 lacks fr_page_list_len in attach input */
-#define RV_ABI_VER_MINOR_5 5
+
+#define RV_ABI_VERSION(major, minor) (((major) << 16) | ((minor) & 0xFFFF))
+#define RV_ABI_VERSION_CURRENT RV_ABI_VERSION(RV_ABI_VER_MAJOR, RV_ABI_VER_MINOR)
 
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 /* this version of GPU ABI */
 #define RV_GPU_ABI_VER_MAJOR 1
 #define RV_GPU_ABI_VER_MINOR 5
+
+/* Document the changes when the GPU ABI version is changed */
 /* 1.0 PIN_MMAP in structure lacked alloc_id */
-#define RV_GPU_ABI_VER_MAJOR_1 1
-#define RV_GPU_ABI_VER_MINOR_0 0
 /* 1.1 was last to permit MUNMAP_UNPIN */
-#define RV_GPU_ABI_VER_MINOR_1 1
 /* 1.2 lacks max_fmr_size in attach output */
-#define RV_GPU_ABI_VER_MINOR_2 2
 /* 1.3 lacks base_addr in reg_mem input */
-#define RV_GPU_ABI_VER_MINOR_3 3
 /* 1.4 lacks fr_page_list_len in attach input */
-#define RV_GPU_ABI_VER_MINOR_4 4
+
+#define RV_GPU_ABI_VERSION(major, minor) (((major) << 16) | ((minor) & 0xFFFF))
+#define RV_GPU_ABI_VERSION_CURRENT RV_GPU_ABI_VERSION(RV_GPU_ABI_VER_MAJOR, RV_GPU_ABI_VER_MINOR)
 
 #endif
 /* define capability flags here */

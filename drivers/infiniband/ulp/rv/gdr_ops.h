@@ -105,8 +105,7 @@ struct rv_gdrdata {
 
 int rv_gdr_init(int rv_inx, struct rv_gdrdata *gd, u8 gpu, u32 cache_size);
 void rv_gdr_deinit(int rv_inx, struct rv_gdrdata *gd);
-int rv_ioctl_gpu_buf_pin_mmap(struct file *fp, struct rv_gdrdata *gd,
-			      unsigned long arg, int rev);
+int rv_ioctl_gpu_buf_pin_mmap(struct file *fp, struct rv_gdrdata *gd, unsigned long arg, u32 rev);
 int rv_ioctl_gpu_evict(struct rv_gdrdata *gd, struct rv_evict_params *params);
 int rv_gdr_mmap(struct file *fp, struct rv_gdrdata *gd,
 		struct vm_area_struct *vma);

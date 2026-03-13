@@ -918,7 +918,7 @@ static int rv_create_rc_qp(struct rv_user_mrs *umrs,
 
 	if (!umrs->send_cq) {
 		umrs->send_cq = ib_alloc_cq_any(dev->ib_dev, umrs, 10,
-						IB_POLL_SOFTIRQ);
+						IB_POLL_WORKQUEUE);
 		if (IS_ERR(umrs->send_cq)) {
 			rv_err(umrs->rv_inx, "Creating send cq failed\n");
 			umrs->send_cq = NULL;
@@ -931,7 +931,7 @@ static int rv_create_rc_qp(struct rv_user_mrs *umrs,
 
 	if (!umrs->recv_cq) {
 		umrs->recv_cq = ib_alloc_cq_any(dev->ib_dev, umrs, 10,
-						IB_POLL_SOFTIRQ);
+						IB_POLL_WORKQUEUE);
 		if (IS_ERR(umrs->recv_cq)) {
 			rv_err(umrs->rv_inx, "Creating recv cq failed\n");
 			umrs->recv_cq = NULL;
@@ -1542,10 +1542,9 @@ static u64 rv_round_req_mem(struct rv_mem_params *mparams)
 }
 
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
-int doit_reg_mem(struct file *fp, struct rv_user *rv, unsigned long arg,
-		 int rev)
+int doit_reg_mem(struct file *fp, struct rv_user *rv, unsigned long arg, u32 rev)
 #else
-int doit_reg_mem(struct rv_user *rv, unsigned long arg, int rev)
+int doit_reg_mem(struct rv_user *rv, unsigned long arg, u32 rev)
 #endif
 {
 	struct rv_mem_params mparams;
@@ -1557,12 +1556,12 @@ int doit_reg_mem(struct rv_user *rv, unsigned long arg, int rev)
 	u64 offset = 0;
 	u64 addr_in;
 
-	if (rev <= RV_ABI_VER_MINOR_1) {
+	if (rev <= RV_ABI_VERSION(1, 1)) {
 		/* smaller input structure */
 		if (copy_from_user(&mparams.in, (void __user *)arg,
 				   sizeof(struct rv_mem_params_r1_in)))
 			return -EFAULT;
-	} else if (rev <= RV_ABI_VER_MINOR_4) {
+	} else if (rev <= RV_ABI_VERSION(1, 4)) {
 		/* smaller input structure */
 		if (copy_from_user(&mparams.in, (void __user *)arg,
 				   sizeof(struct rv_mem_params_r4_in)))
@@ -1625,7 +1624,7 @@ int doit_reg_mem(struct rv_user *rv, unsigned long arg, int rev)
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 	if (mparams.in.access & IBV_ACCESS_IS_GPU_ADDR) {
 #ifdef INTEL_GPU_DIRECT
-		if (rev <= RV_ABI_VER_MINOR_4) {
+		if (rev <= RV_ABI_VERSION(1, 4)) {
 			/*
 			 * lacks alloc_id and base_addr, which are needed for
 			 * I-GPU caching

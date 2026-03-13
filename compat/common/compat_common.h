@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: (GPL-2.0 OR BSD-3-Clause) */
 /*
- * Copyright(c) 2020 Intel Corporation.
+ * Copyright(c) 2020 - 2025 Intel Corporation.
  */
 #if !defined(COMPAT_COMMON_H)
 #define COMPAT_COMMON_H
@@ -806,5 +806,12 @@ static inline void xa_destroy(struct xarray *xa)
 	     ++id)
 
 #endif  /* !defined(HAVE_XARRAY) && !defined(HAVE_MOFED) */
+
+#ifdef NEED_FUNC_IB_COPY_PATH_REC_FROM_USER
+#include <rdma/ib_sa.h>
+#include <rdma/ib_user_sa.h>
+void ib_copy_path_rec_from_user(struct sa_path_rec *dst,
+				struct ib_user_path_rec *src);
+#endif
 
 #endif /* !defined(COMPAT_COMMON_H) */

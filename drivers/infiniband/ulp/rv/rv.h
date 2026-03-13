@@ -1100,9 +1100,9 @@ void rv_queue_work3(struct work_struct *work);
 void rv_mr_init(void);
 #if defined(NVIDIA_GPU_DIRECT) || defined(INTEL_GPU_DIRECT)
 int doit_reg_mem(struct file *fp, struct rv_user *rv, unsigned long arg,
-		 int rev);
+		 u32 rev);
 #else
-int doit_reg_mem(struct rv_user *rv, unsigned long arg, int rev);
+int doit_reg_mem(struct rv_user *rv, unsigned long arg, u32 rev);
 #endif
 int doit_dereg_mem(struct rv_user *rv, unsigned long arg);
 int doit_evict(struct file *fp, struct rv_user *rv, unsigned long arg);

@@ -23,7 +23,11 @@ DECLARE_EVENT_CLASS(/* gmr */
 	),
 	TP_fast_assign(/* assign */
 		__entry->inx = inx;
+#ifdef HAVE_TRACE_ASSIGN_STR_ONLY_DST
+		__assign_str(msg);
+#else
 		__assign_str(msg, msg);
+#endif
 		__entry->d1 = d1;
 		__entry->d2 = d2;
 	),

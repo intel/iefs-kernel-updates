@@ -9,10 +9,10 @@ ifneq ($(KERNELRELEASE),)
 
 ifneq ($(MOFED_PATH),)
 NOSTDINC_FLAGS += -I$(MOFED_PATH)/include -I$(MOFED_PATH)/include/uapi -DHAVE_MOFED
-# Get the major version
-MOFED_VER ?= $(shell cat $(MOFED_PATH)/compat_base | cut -d '-' -f 4)
-MOFED_MAJ_VER ?= $(shell echo $(MOFED_VER) | cut -c3-4 | sed 's/^0//')
-MOFED_MIN_VER ?= $(shell echo $(MOFED_VER) | cut -c5-6 | sed 's/^0//')
+# Get the mofed version from ofed_info
+MOFED_VER ?= $(shell ofed_info -n | cut -d'-' -f1)
+MOFED_MAJ_VER ?= $(shell echo $(MOFED_VER) | cut -d'.' -f1 | sed 's/^0//')
+MOFED_MIN_VER ?= $(shell echo $(MOFED_VER) | cut -d'.' -f2 | sed 's/^0//')
 $(info *** Detected MOFED_VER: $(MOFED_VER) ($(MOFED_MAJ_VER).$(MOFED_MIN_VER)) *** )
 NOSTDINC_FLAGS += -DMOFED_MJVER=$(MOFED_MAJ_VER)
 NOSTDINC_FLAGS += -DMOFED_MINVER=$(MOFED_MIN_VER)

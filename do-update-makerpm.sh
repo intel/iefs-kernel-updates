@@ -130,8 +130,8 @@ function check_upstream_kernel() {
 }
 
 gpubuild="false"
-srcdir=""
-workdir=""
+srcdir="$(realpath .)"
+workdir="$(realpath .)/tmp"
 filedir=""
 ifs_distro=""
 distro=""

@@ -1023,11 +1023,9 @@ do_mmap_gpu_buf(struct file *fp, struct gdr_mr *gmr)
  * -EFAULT on bad parameter block address
  * -EINVAL on invalid content of parameter block
  */
-int
-fetch_user_mparams(unsigned long arg, int rev,
-		   struct rv_gpu_mem_params *mparams)
+static int fetch_user_mparams(unsigned long arg, u32 rev, struct rv_gpu_mem_params *mparams)
 {
-	if (rev <= RV_GPU_ABI_VER_MINOR_0) {
+	if (rev <= RV_GPU_ABI_VERSION(1, 0)) {
 		/* smaller structure w/o alloc_id */
 		if (copy_from_user(&mparams->in,
 				   (struct rv_gpu_mem_params __user *)arg,
@@ -1045,7 +1043,7 @@ fetch_user_mparams(unsigned long arg, int rev,
 	    (mparams->in.gpu_buf_addr & ~GPU_PAGE_MASK) ||
 	    (mparams->in.gpu_buf_size & ~GPU_PAGE_MASK))
 #else
-	    (rev <= RV_GPU_ABI_VER_MINOR_0) ||	/* lacks alloc_id */
+	    (rev <= RV_GPU_ABI_VERSION(1, 0)) || /* lacks alloc_id */
 	    !(mparams->in.ipc_handle))
 #endif
 		return -EINVAL;
@@ -1089,9 +1087,7 @@ fetch_user_mparams(unsigned long arg, int rev,
  * -EINVAL - The operation requested was not valid,
  * -ENOENT - An unpin was requested, but the desired gpu buffer was not found,
  */
-int
-rv_ioctl_gpu_buf_pin_mmap(struct file *fp, struct rv_gdrdata *gd,
-			  unsigned long arg, int rev)
+int rv_ioctl_gpu_buf_pin_mmap(struct file *fp, struct rv_gdrdata *gd, unsigned long arg, u32 rev)
 {
 	struct rv_gpu_mem_params mparams;
 	struct gdr_mr *gmr = NULL;
