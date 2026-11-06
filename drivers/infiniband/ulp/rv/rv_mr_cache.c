@@ -539,6 +539,7 @@ static struct rv_mr_cache_entry *rv_mr_cache_search(struct rv_mr_cache *cache,
 						    struct rv_mr_cached *mrc_in)
 {
 	struct rv_mr_cache_entry *mrce = NULL;
+	struct rv_mr_cache_entry *fallback_mrce = NULL;
 
 	trace_rv_mr_cache_search_enter(addr, len, acc);
 
@@ -565,6 +566,18 @@ static struct rv_mr_cache_entry *rv_mr_cache_search(struct rv_mr_cache *cache,
 					continue;
 				}
 				break;
+			case RV_MRC_SEARCH_INSERT:
+				if (mrce->freeing)
+					continue;
+				break;
+			case RV_MRC_SEARCH_GET_RDMA:
+				if (mrce->freeing) {
+					if (!fallback_mrce &&
+					    cache->ops->filter(mrce, addr, len, acc))
+						fallback_mrce = mrce;
+					continue;
+				}
+				break;
 			case RV_MRC_SEARCH_PUT:
 				mrc = container_of(mrce, struct rv_mr_cached, entry);
 				if (mrce->user_refcount < 1 || mrc != mrc_in)
@@ -580,6 +593,8 @@ static struct rv_mr_cache_entry *rv_mr_cache_search(struct rv_mr_cache *cache,
 			if (cache->ops->filter(mrce, addr, len, acc))
 				return mrce;
 		}
+		if (!mrce)
+			mrce = fallback_mrce;
 	}
 	return mrce;
 }
@@ -590,7 +605,6 @@ static struct rv_mr_cache_entry *rv_mr_cache_search(struct rv_mr_cache *cache,
  * return:
  *     NULL - Not found;
  *     A valid cache entry pointer;
- *     -ENOENT - The buffer is being freed (only for GPU).
  */
 
 struct rv_mr_cache_entry *rv_mr_cache_search_get(struct rv_mr_cache *cache,
