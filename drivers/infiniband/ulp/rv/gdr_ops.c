@@ -1864,7 +1864,6 @@ free_sgl:
 }
 
 /* for RDMA WQE handling */
-/* Could return an ERROR for GPU if MR is stale ("freeing") */
 struct rv_mr_cache_entry *rv_gdr_search_get(struct rv_gdrdata *gd,
 					    struct rv_post_write_params *params)
 {
